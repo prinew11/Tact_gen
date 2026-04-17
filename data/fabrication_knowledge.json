@@ -1,0 +1,134 @@
+{
+  "entries": [
+    {
+      "id": "slope_limit_3axis",
+      "type": "procedural",
+      "tags": ["slope", "3-axis", "machining", "angle", "undercut"],
+      "title": "Maximum slope for 3-axis CNC machining",
+      "content": "The maximum surface slope must not exceed 45 degrees for 3-axis machining. Slopes beyond this create undercuts that a ball-end mill cannot reach. The slope is measured as the angle between the surface normal and the Z-axis (tool axis).",
+      "constraint": {
+        "parameter": "max_slope_deg",
+        "value": 45.0,
+        "unit": "degrees",
+        "correction": "gaussian_smooth"
+      }
+    },
+    {
+      "id": "tool_radius_min_feature",
+      "type": "procedural",
+      "tags": ["tool", "radius", "feature", "minimum", "ball-end-mill", "resolution"],
+      "title": "Minimum feature size from tool geometry",
+      "content": "The minimum machinable feature size equals twice the tool radius (i.e., the tool diameter). A ball-end mill with radius R cannot cut concave features smaller than 2R. Features below this threshold should be removed or enlarged via morphological filtering.",
+      "constraint": {
+        "parameter": "min_feature_mm",
+        "value_expr": "tool_radius_mm * 2",
+        "unit": "mm",
+        "correction": "morphological_open"
+      }
+    },
+    {
+      "id": "height_range_clamp",
+      "type": "procedural",
+      "tags": ["height", "range", "clamp", "overflow", "z-axis"],
+      "title": "Heightfield value range",
+      "content": "The heightfield values must lie in [0, 1] before geometry conversion. Values outside this range produce geometry that exceeds the specified max_height_mm, leading to collisions or over-travel on the Z-axis. Clamp after all corrections.",
+      "constraint": {
+        "parameter": "height_range",
+        "value": [0.0, 1.0],
+        "correction": "clamp"
+      }
+    },
+    {
+      "id": "face_count_fusion",
+      "type": "procedural",
+      "tags": ["face", "count", "mesh", "fusion", "CAM", "stability", "triangle"],
+      "title": "STL face count limit for Fusion 360 CAM",
+      "content": "Fusion 360 CAM workspace becomes unstable with meshes exceeding 500,000 faces. The 512x512 heightfield produces ~524,288 top-surface triangles plus walls and bottom. Downsample the heightfield before meshing if the count exceeds the limit, or use adaptive decimation.",
+      "constraint": {
+        "parameter": "max_face_count",
+        "value": 500000,
+        "correction": "downsample_or_decimate"
+      }
+    },
+    {
+      "id": "watertight_requirement",
+      "type": "procedural",
+      "tags": ["watertight", "manifold", "closed", "mesh", "STL", "fabrication"],
+      "title": "Watertight mesh requirement",
+      "content": "The output STL must be watertight (manifold, closed). Non-watertight meshes cause slicer failures, incorrect toolpath generation, and unpredictable machining behavior. The geometry module constructs a closed solid with top surface, bottom plane, and four side walls.",
+      "constraint": {
+        "parameter": "watertight",
+        "value": true,
+        "correction": "rebuild_mesh"
+      }
+    },
+    {
+      "id": "gradient_continuity",
+      "type": "semantic",
+      "tags": ["gradient", "smooth", "continuity", "surface", "chatter", "vibration"],
+      "title": "Surface gradient continuity for machining quality",
+      "content": "Abrupt height transitions cause tool chatter and poor surface finish during CNC milling. The heightfield should have C1-continuous gradients where possible. Apply gradient-aware smoothing that preserves large-scale tactile features while removing sub-pixel discontinuities. A Gaussian kernel with sigma proportional to the tool radius provides a physically-motivated smoothing scale."
+    },
+    {
+      "id": "tactile_preservation",
+      "type": "semantic",
+      "tags": ["tactile", "texture", "preservation", "fidelity", "perception", "roughness"],
+      "title": "Tactile feature preservation during post-processing",
+      "content": "Post-processing for fabrication must preserve the perceptual tactile qualities of the heightfield. Over-smoothing destroys roughness and fine texture that the diffusion model learned to generate. Use the minimum smoothing needed to satisfy slope and feature-size constraints. Prefer local corrections (only smooth where violations occur) over global smoothing."
+    },
+    {
+      "id": "ball_end_mill_scallop",
+      "type": "semantic",
+      "tags": ["ball-end-mill", "scallop", "stepover", "surface", "finish", "toolpath"],
+      "title": "Ball-end mill scallop height and stepover",
+      "content": "A ball-end mill with radius R and stepover S leaves scallop marks of height approximately S^2/(8R). For R=0.5mm and S=0.3mm, scallop height is ~0.0225mm. Surface features smaller than the scallop height are invisible in the final part. This sets a noise floor below which heightfield detail is meaningless."
+    },
+    {
+      "id": "wood_material_rules",
+      "type": "semantic",
+      "tags": ["wood", "material", "grain", "direction", "anisotropic", "feed"],
+      "title": "Wood machining: grain direction considerations",
+      "content": "Wood is anisotropic — machining against the grain causes tear-out and fuzzy surfaces. For wood substrates, tactile patterns with strong directionality should align features along the grain direction. The feed direction in the toolpath should follow the grain where possible."
+    },
+    {
+      "id": "concrete_stone_material",
+      "type": "semantic",
+      "tags": ["concrete", "stone", "hard", "material", "brittle", "depth"],
+      "title": "Hard material machining constraints",
+      "content": "Concrete and stone are brittle materials. Deep cuts risk chipping and fracture. For these materials, limit the max height variation and prefer gradual slopes. A max_height_mm of 3mm with gentler slopes (< 30 degrees) is recommended for brittle substrates."
+    },
+    {
+      "id": "fabric_soft_material",
+      "type": "semantic",
+      "tags": ["fabric", "soft", "material", "flexible", "texture", "fine"],
+      "title": "Fabric-like tactile texture generation",
+      "content": "Fabric textures are characterized by fine, repetitive patterns with moderate roughness and strong directionality. When generating tactile representations of fabric, preserve the high-frequency weave pattern. The heightfield should have relatively low amplitude (smooth to touch) but high spatial frequency."
+    },
+    {
+      "id": "bark_organic_material",
+      "type": "semantic",
+      "tags": ["bark", "organic", "rough", "deep", "texture", "natural"],
+      "title": "Bark and organic texture machining",
+      "content": "Bark textures have deep grooves and high roughness. They benefit from the full max_height_mm range. Slope violations are common in bark-like textures due to deep crevices. Apply targeted smoothing to the deepest valleys while preserving the rough character of ridges."
+    },
+    {
+      "id": "adaptive_smoothing_strategy",
+      "type": "semantic",
+      "tags": ["adaptive", "smoothing", "iterative", "correction", "strategy"],
+      "title": "Iterative adaptive smoothing strategy",
+      "content": "Apply corrections iteratively: (1) Identify pixels where slope exceeds the limit. (2) Apply localized Gaussian smoothing only to violation regions with a margin. (3) Re-check. Repeat until all violations are resolved or a maximum iteration count is reached. This preserves tactile fidelity in compliant regions while fixing only the problematic areas."
+    },
+    {
+      "id": "grbl_feedrate_limit",
+      "type": "procedural",
+      "tags": ["grbl", "feedrate", "speed", "minimum", "firmware"],
+      "title": "GRBL minimum feedrate",
+      "content": "GRBL firmware 1.1+ has a hard minimum feedrate of 45 mm/min. Toolpaths that require slower feeds (e.g., very steep surfaces with small stepovers) will be clamped to this value, potentially causing over-cutting. Ensure the surface geometry doesn't demand feeds below this floor.",
+      "constraint": {
+        "parameter": "min_feedrate_mm_min",
+        "value": 45.0,
+        "unit": "mm/min"
+      }
+    }
+  ]
+}
