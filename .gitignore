@@ -1,0 +1,9 @@
+.claude/
+.vscode/
+checkpoints/
+outputs/
+data/
+*.zip
+*.pth
+*.bin
+*.png
