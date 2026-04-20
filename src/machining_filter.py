@@ -45,6 +45,9 @@ class MachiningFilterConfig:
     gaussian_sigma_px: float = 0.0     # 0 = auto from tool scale
     max_iterations: int = 10
     target_resolution_mode: str = "auto"   # "auto" | "fixed"
+    # 0 = auto-compute from physical_size / tool_diameter (enables terracing);
+    # 1 = no terracing; ≥2 = explicit step count.
+    terrace_steps: int = 0
 
 
 @dataclass
@@ -60,6 +63,7 @@ class MachiningFilterReport:
     height_scale_applied: float = 1.0
     smoothing_sigma_px: float = 0.0
     morph_radius_px: float = 0.0
+    terrace_steps_applied: int = 0
     passed: bool = False
     issues: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
@@ -129,18 +133,35 @@ def smooth_by_tool_scale(
     tool_radius_mm: float,
     pixel_size_mm: float,
     sigma_override_px: float = 0.0,
+    terrace_steps: int = 1,
 ) -> np.ndarray:
     """
-    Gaussian blur with sigma = tool_radius_mm / pixel_size_mm.
-    Features smaller than tool radius are unreachable; smoothing reduces
-    their impact on fabrication without hard-deleting them (morphological
-    opening handles that step separately).
-    Minimum sigma = 1 px to avoid a no-op at low resolutions.
+    Gaussian blur at sigma = tool_radius_mm / pixel_size_mm, then optionally
+    quantize into discrete height levels to produce a circular-step "terraced"
+    topology (like a topographic contour map).
+
+    Terracing guarantees each plateau is spatially at least ~tool_diameter wide:
+    the prior Gaussian places all height transitions at least 2*sigma ≈
+    tool_diameter apart in pixel space, so the quantized steps respect the
+    minimum feature constraint.
+
+    Args:
+        terrace_steps: number of discrete height levels.  1 = no terracing.
     """
     sigma = sigma_override_px if sigma_override_px > 0.0 else max(
         tool_radius_mm / pixel_size_mm, 1.0
     )
-    return gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
+    hf = gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
+
+    if terrace_steps > 1:
+        # Quantize to N discrete levels (circular-step / terraced structure).
+        n = terrace_steps - 1
+        hf = np.round(hf * n) / n
+        # Soften riser edges so they don't create near-vertical walls.
+        hf = gaussian_filter(hf, sigma=max(sigma * 0.5, 1.0))
+        hf = np.clip(hf, 0.0, 1.0)
+
+    return hf
 
 
 def suppress_narrow_recesses(
@@ -167,6 +188,20 @@ def suppress_narrow_recesses(
     inv_opened = grey_dilation(inv_eroded, footprint=disk)
 
     return np.clip(1.0 - inv_opened, 0.0, 1.0).astype(np.float32)
+
+
+def prune_high_frequency_content(
+    heightfield: np.ndarray,
+    tool_radius_mm: float,
+    pixel_size_mm: float,
+) -> np.ndarray:
+    """
+    Remove spatial noise finer than half the tool radius before terracing.
+    Avoids ragged step edges caused by sub-tool-scale texture in the diffusion
+    output.  Uses a mild Gaussian (sigma = 0.5 * tool_radius / pixel_size).
+    """
+    sigma = max(tool_radius_mm * 0.5 / pixel_size_mm, 0.5)
+    return gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
 
 
 def compress_height_for_slope(
@@ -274,7 +309,25 @@ def filter_heightfield_for_machining(
     slope_before_map = estimate_slope_map_deg(hf, pixel_size_mm, config.max_height_mm)
     report.max_slope_deg_before = float(slope_before_map.max())
 
-    # --- Step 4: Tool-scale Gaussian smoothing ---
+    # --- Step 3.5: Resolve terrace step count ---
+    # 0 = auto: each plateau ~ tool_diameter * factor wide on average.
+    if config.terrace_steps == 0:
+        tool_diameter_mm = config.tool_radius_mm * 2.0
+        actual_terrace_steps = max(
+            2,
+            round(config.physical_size_mm / (tool_diameter_mm * config.target_min_feature_factor)),
+        )
+    else:
+        actual_terrace_steps = config.terrace_steps
+    report.terrace_steps_applied = actual_terrace_steps
+
+    # --- Step 3.6: Prune sub-tool-scale noise before terracing ---
+    # Prevents noisy step edges caused by diffusion micro-texture.
+    if actual_terrace_steps > 1:
+        hf = prune_high_frequency_content(hf, config.tool_radius_mm, pixel_size_mm)
+        hf = np.clip(hf, 0.0, 1.0)
+
+    # --- Step 4: Tool-scale Gaussian smoothing + circular-step terracing ---
     sigma_px = (
         config.gaussian_sigma_px
         if config.gaussian_sigma_px > 0.0
@@ -282,7 +335,9 @@ def filter_heightfield_for_machining(
     )
     report.smoothing_sigma_px = sigma_px
     hf = smooth_by_tool_scale(
-        hf, config.tool_radius_mm, pixel_size_mm, sigma_override_px=sigma_px
+        hf, config.tool_radius_mm, pixel_size_mm,
+        sigma_override_px=sigma_px,
+        terrace_steps=actual_terrace_steps,
     )
     hf = np.clip(hf, 0.0, 1.0)
 
@@ -375,6 +430,7 @@ def save_report_json(report: MachiningFilterReport, out_path: str | Path) -> Non
         "height_scale_applied": report.height_scale_applied,
         "smoothing_sigma_px": report.smoothing_sigma_px,
         "morph_radius_px": report.morph_radius_px,
+        "terrace_steps_applied": report.terrace_steps_applied,
         "passed": report.passed,
         "issues": report.issues,
         "recommendations": report.recommendations,
