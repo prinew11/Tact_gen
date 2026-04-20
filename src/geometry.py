@@ -19,6 +19,7 @@ class GeometryConfig:
     physical_size_mm: float = 50.0 # physical XY extent in mm
     max_height_mm: float = 5.0     # Z range in mm
     base_thickness_mm: float = 2.0 # flat bottom thickness in mm
+    face_limit: int = 500_000      # decimate to this after building grid mesh
 
 
 def heightfield_to_mesh(
@@ -42,9 +43,15 @@ def heightfield_to_mesh(
     if config is None:
         config = GeometryConfig()
 
-    # Downsample heightfield to mesh_resolution to control face count
+    # Only resize if the heightfield exceeds the face budget.
+    # machining_filter already downsamples to ~354 px using INTER_AREA and then
+    # applies terracing at that resolution.  Re-resizing with any interpolation
+    # (NEAREST creates 1-px jumps; AREA blurs steps) would corrupt the result.
+    # Raw inputs (512 px, ~1M faces) still need downsizing.
     mr = config.mesh_resolution
-    if heightfield.shape[0] != mr or heightfield.shape[1] != mr:
+    n = min(heightfield.shape) - 1
+    face_estimate = 4 * n * (n + 2)   # top + bottom + 4 side walls
+    if face_estimate > config.face_limit:
         heightfield = cv2.resize(heightfield, (mr, mr), interpolation=cv2.INTER_AREA)
 
     h, w = heightfield.shape
@@ -106,6 +113,16 @@ def heightfield_to_mesh(
         faces=np.array(faces, dtype=np.int64),
         process=True,
     )
+
+    # Decimate to merge coplanar faces on flat terrace regions.
+    # Requires the optional fast_simplification package; skipped if absent.
+    target = min(len(mesh.faces), config.face_limit)
+    if len(mesh.faces) > target:
+        try:
+            mesh = mesh.simplify_quadric_decimation(target)
+        except (ImportError, ModuleNotFoundError):
+            pass
+
     return mesh
 
 

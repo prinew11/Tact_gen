@@ -89,12 +89,15 @@ def compute_pixel_size_mm(physical_size_mm: float, resolution: int) -> float:
 
 def estimate_face_count(resolution: int) -> int:
     """
-    Estimate triangle count for a watertight heightfield mesh.
-    Formula: 4 * (N-1)^2  (top + bottom quads × 2 triangles each).
-    At N=350 → 487,204 faces, just under the 500k default Fusion limit.
+    Estimate triangle count for a watertight heightfield mesh including side walls.
+    Formula: 4*(N-1)*(N+1) = top quads + bottom quads + 4 side wall strips.
+      top/bottom: 2*(N-1)^2 each = 4*(N-1)^2 total
+      4 side walls: 4*(N-1)*2 total
+      combined: 4*(N-1)*((N-1)+2) = 4*(N-1)*(N+1)
+    At N=353 → 498,816 faces, safely under the 500k Fusion limit.
     """
     n = resolution - 1
-    return 4 * n * n
+    return 4 * n * (n + 2)
 
 
 def estimate_target_resolution_for_face_budget(
@@ -107,8 +110,8 @@ def estimate_target_resolution_for_face_budget(
     """
     if estimate_face_count(current_res) <= face_limit:
         return current_res
-    # Solve 4*(R-1)^2 <= face_limit  =>  R <= 1 + sqrt(face_limit / 4)
-    r_max = int(math.floor(1.0 + math.sqrt(face_limit / 4.0)))
+    # Solve 4*(R-1)*(R+1) <= face_limit => R^2 <= face_limit/4 + 1
+    r_max = int(math.floor(math.sqrt(face_limit / 4.0 + 1.0)))
     return max(r_max, 2)
 
 
@@ -134,19 +137,18 @@ def smooth_by_tool_scale(
     pixel_size_mm: float,
     sigma_override_px: float = 0.0,
     terrace_steps: int = 1,
+    riser_sigma_px: float = 0.0,
 ) -> np.ndarray:
     """
     Gaussian blur at sigma = tool_radius_mm / pixel_size_mm, then optionally
     quantize into discrete height levels to produce a circular-step "terraced"
     topology (like a topographic contour map).
 
-    Terracing guarantees each plateau is spatially at least ~tool_diameter wide:
-    the prior Gaussian places all height transitions at least 2*sigma ≈
-    tool_diameter apart in pixel space, so the quantized steps respect the
-    minimum feature constraint.
-
     Args:
         terrace_steps: number of discrete height levels.  1 = no terracing.
+        riser_sigma_px: Gaussian sigma for step-edge softening.
+            0 = auto (sigma * 0.5).  Pass a slope-calibrated value from
+            filter_heightfield_for_machining for physically correct risers.
     """
     sigma = sigma_override_px if sigma_override_px > 0.0 else max(
         tool_radius_mm / pixel_size_mm, 1.0
@@ -154,14 +156,32 @@ def smooth_by_tool_scale(
     hf = gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
 
     if terrace_steps > 1:
-        # Quantize to N discrete levels (circular-step / terraced structure).
         n = terrace_steps - 1
         hf = np.round(hf * n) / n
-        # Soften riser edges so they don't create near-vertical walls.
-        hf = gaussian_filter(hf, sigma=max(sigma * 0.5, 1.0))
+        r_sigma = riser_sigma_px if riser_sigma_px > 0.0 else max(sigma * 0.5, 1.0)
+        hf = gaussian_filter(hf, sigma=r_sigma)
         hf = np.clip(hf, 0.0, 1.0)
 
     return hf
+
+
+def apply_terracing(
+    heightfield: np.ndarray,
+    terrace_steps: int,
+    riser_sigma_px: float = 1.0,
+) -> np.ndarray:
+    """
+    Quantize a smooth heightfield into discrete terrace levels and soften
+    the step risers.  Separating this from smooth_by_tool_scale lets the
+    morphological opening run first (on the smooth surface), so it never
+    inadvertently widens or distorts the step edges.
+    """
+    if terrace_steps <= 1:
+        return heightfield.copy()
+    n = terrace_steps - 1
+    hf = np.round(heightfield.astype(np.float32) * n) / n
+    hf = gaussian_filter(hf, sigma=max(riser_sigma_px, 1.0))
+    return np.clip(hf, 0.0, 1.0)
 
 
 def suppress_narrow_recesses(
@@ -321,27 +341,15 @@ def filter_heightfield_for_machining(
         actual_terrace_steps = config.terrace_steps
     report.terrace_steps_applied = actual_terrace_steps
 
-    # --- Step 3.6: Prune sub-tool-scale noise before terracing ---
-    # Prevents noisy step edges caused by diffusion micro-texture.
-    if actual_terrace_steps > 1:
-        hf = prune_high_frequency_content(hf, config.tool_radius_mm, pixel_size_mm)
-        hf = np.clip(hf, 0.0, 1.0)
-
-    # --- Step 4: Tool-scale Gaussian smoothing + circular-step terracing ---
-    sigma_px = (
-        config.gaussian_sigma_px
-        if config.gaussian_sigma_px > 0.0
-        else max(config.tool_radius_mm / pixel_size_mm, 1.0)
-    )
-    report.smoothing_sigma_px = sigma_px
-    hf = smooth_by_tool_scale(
-        hf, config.tool_radius_mm, pixel_size_mm,
-        sigma_override_px=sigma_px,
-        terrace_steps=actual_terrace_steps,
-    )
+    # --- Step 3.6: Prune sub-tool-scale noise ---
+    hf = prune_high_frequency_content(hf, config.tool_radius_mm, pixel_size_mm)
     hf = np.clip(hf, 0.0, 1.0)
 
-    # --- Step 5: Suppress sub-tool-diameter recesses ---
+    # --- Step 4: Suppress sub-tool-diameter recesses BEFORE full Gaussian ---
+    # Must run on the relatively unsmoothed surface: the full-scale Gaussian
+    # (σ = tool_radius / pixel_size) broadens narrow trenches to FWHM ≈ 2.35·σ,
+    # which can exceed the disk diameter and defeat the opening.  Pruning (mild
+    # σ = 0.5·tool_radius) leaves trench widths well below the disk diameter.
     tool_radius_px = config.tool_radius_mm / pixel_size_mm
     report.morph_radius_px = tool_radius_px
     hf = suppress_narrow_recesses(hf, tool_radius_px)
@@ -352,20 +360,62 @@ def filter_heightfield_for_machining(
         f"opening (tool diameter {tool_diameter_mm:.1f} mm)"
     )
 
+    # --- Step 5: Gaussian smoothing (no terracing yet) ---
+    # Terracing is deferred until after smoothing so the opening result blends
+    # smoothly into the surface before discrete levels are applied.
+    sigma_px = (
+        config.gaussian_sigma_px
+        if config.gaussian_sigma_px > 0.0
+        else max(config.tool_radius_mm / pixel_size_mm, 1.0)
+    )
+    report.smoothing_sigma_px = sigma_px
+    hf = smooth_by_tool_scale(
+        hf, config.tool_radius_mm, pixel_size_mm,
+        sigma_override_px=sigma_px,
+        terrace_steps=1,          # Gaussian only — terracing applied in step 5b
+    )
+    hf = np.clip(hf, 0.0, 1.0)
+
+    # --- Step 5b: Terracing with slope-calibrated riser sigma ---
+    # Riser sigma is derived so the step edges are as sharp as possible while
+    # still satisfying the max_slope_deg constraint.
+    # For a Gaussian-convolved unit step: max_slope = step_height /
+    #   (riser_sigma * pixel_size * sqrt(2π)).  Solving for riser_sigma:
+    if actual_terrace_steps > 1 and config.max_height_mm > 0 and config.max_slope_deg > 0:
+        step_height_mm = config.max_height_mm / (actual_terrace_steps - 1)
+        riser_sigma_px = max(
+            step_height_mm / (
+                math.tan(math.radians(config.max_slope_deg))
+                * pixel_size_mm
+                * math.sqrt(2 * math.pi)
+            ),
+            1.0,
+        )
+    else:
+        riser_sigma_px = max(sigma_px * 0.5, 1.0)
+    hf = apply_terracing(hf, actual_terrace_steps, riser_sigma_px)
+    hf = np.clip(hf, 0.0, 1.0)
+
     # --- Step 6: Height compression ---
+    # Scale is embedded into heightfield values so geometry.py can use
+    # max_height_mm unchanged and still get the correct physical height.
+    # Use 97% of max_slope_deg as the target: np.gradient slightly underestimates
+    # slopes compared to mesh-normal computation, so a small margin prevents the
+    # fabrication check from reporting a borderline failure.
     hf, scale = compress_height_for_slope(
         hf,
-        config.max_slope_deg,
+        config.max_slope_deg * 0.97,
         pixel_size_mm,
         config.max_height_mm,
         config.max_iterations,
     )
     report.height_scale_applied = scale
+    hf = (hf * scale).astype(np.float32)
     if scale < 0.95:
         report.recommendations.append(
-            f"Height compressed to {scale:.2f}× of max_height_mm "
-            f"({config.max_height_mm * scale:.2f} mm effective) to satisfy slope limit. "
-            "Pass height_scale_applied to GeometryConfig.max_height_mm for accurate mesh."
+            f"Height compressed to {scale:.2f}× "
+            f"({config.max_height_mm * scale:.2f} mm effective). "
+            "Scale is embedded in the saved heightfield — use max_height_mm as-is."
         )
 
     # --- Step 7: Clip to [0, 1] (no re-normalize: avoids amplifying tiny
@@ -373,8 +423,9 @@ def filter_heightfield_for_machining(
     hf = np.clip(hf, 0.0, 1.0)
 
     # --- Step 8: Final metrics ---
-    effective_height_mm = config.max_height_mm * scale
-    slope_after = estimate_slope_map_deg(hf, pixel_size_mm, effective_height_mm)
+    # hf already has scale baked in (hf = original * scale), so physical height
+    # is hf * max_height_mm — do NOT multiply by scale again.
+    slope_after = estimate_slope_map_deg(hf, pixel_size_mm, config.max_height_mm)
     report.max_slope_deg_after = float(slope_after.max())
 
     report.min_feature_target_mm = tool_diameter_mm
