@@ -13,9 +13,8 @@ class PipelineConfig:
     output_dir: str = "outputs"
     physical_size_mm: float = 50.0
     max_height_mm: float = 5.0
-    tool_radius_mm: float = 3.0        # 6 mm diameter ball-end mill
+    tool_radius_mm: float = 0.5
     material_hint: str | None = None
-    apply_machining_filter: bool = True
 
 
 def run_pipeline(config: PipelineConfig) -> None:
@@ -62,32 +61,6 @@ def run_pipeline(config: PipelineConfig) -> None:
     hf_path = out / "heightfields" / "heightfield.npy"
     save_heightfield(heightfield, hf_path)
     print(f"  Corrected heightfield saved: {hf_path}")
-
-    if config.apply_machining_filter:
-        print("=== Stage 3.8: Machining filter ===")
-        from machining_filter import (
-            MachiningFilterConfig,
-            filter_heightfield_for_machining,
-            save_report_json,
-            save_heightfield as save_machinable,
-        )
-        mf_cfg = MachiningFilterConfig(
-            physical_size_mm=config.physical_size_mm,
-            max_height_mm=config.max_height_mm,
-            tool_radius_mm=config.tool_radius_mm,
-        )
-        heightfield, mf_report = filter_heightfield_for_machining(heightfield, mf_cfg)
-        hf_machinable_path = out / "heightfields" / "heightfield_machinable.npy"
-        save_machinable(heightfield, hf_machinable_path)
-        save_report_json(mf_report, out / "heightfields" / "machining_filter_report.json")
-        print(f"  Passed: {mf_report.passed}")
-        print(
-            f"  Slope: {mf_report.max_slope_deg_before:.1f}° → "
-            f"{mf_report.max_slope_deg_after:.1f}°"
-        )
-        print(f"  Height scale: {mf_report.height_scale_applied:.3f}")
-        for issue in mf_report.issues:
-            print(f"  WARNING: {issue}")
 
     print("=== Stage 4: Geometry (STL) ===")
     geo_cfg = GeometryConfig(

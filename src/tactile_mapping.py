@@ -5,6 +5,7 @@ from visual preprocessed feature maps.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from skimage.feature import graycomatrix, graycoprops
 
 import numpy as np
 
@@ -16,38 +17,45 @@ class TactileDescriptor:
     frequency: float        # normalized dominant spatial frequency
 
 
-def compute_roughness(frequency_map: np.ndarray) -> float:
-    """Mean high-frequency energy as roughness proxy."""
-    return float(np.mean(frequency_map))
+def _to_uint_levels(gray: np.ndarray, levels: int = 16) -> np.ndarray:
+    gray = np.asarray(gray, dtype=np.float32)
+    gray = gray - gray.min()
+    if gray.max() > 0:
+        gray = gray / gray.max()
+    gray_q = np.clip((gray * (levels - 1)).round(), 0, levels - 1).astype(np.uint8)
+    return gray_q
+
+def compute_glcm_features(gray: np.ndarray, 
+                          distances:tuple[int,...]=(1,2,4), 
+                          angles:tuple[float, ...] = (0.0, np.pi/4, np.pi/2, 3*np.pi/4),
+                          levels:int=16) -> dict[str, float]:
+    gray_q = _to_uint_levels(gray, levels=levels)
+    glcm = graycomatrix(gray_q, distances=distances, angles=angles, levels=levels, symmetric=True, normed=True)
+    return {
+        "contrast": graycoprops(glcm, "contrast"),
+        "correlation": graycoprops(glcm, "correlation"),
+        "homogeneity": graycoprops(glcm, "homogeneity"),
+        "energy": graycoprops(glcm, "energy"),
+    }
 
 
-def compute_directionality(
-    orientation_strength: np.ndarray | None = None,
-    gray: np.ndarray | None = None,
-) -> float:
-    """
-    Directional selectivity of the texture, in [0, 1].
 
-    Prefers Gabor-based orientation_strength (from preprocessing) when
-    available; falls back to gradient histogram entropy on gray.
-    """
-    if orientation_strength is not None:
-        return float(np.mean(orientation_strength))
 
-    # fallback: gradient-based (kept for backward compat)
-    if gray is None:
+def compute_roughness(glcm_features:dict[str,np.array]) -> float:
+    contrast = float(glcm_features["contrast"].mean())
+    homogeneity = float(glcm_features["homogeneity"].mean())
+    rough = 0.7 * float(np.clip(contrast/8.0, 0.0, 1.0)) + 0.3 * (1.0 - np.clip(homogeneity, 0.0, 1.0))
+    return float(np.clip(rough, 0.0, 1.0))
+
+
+def compute_directionality(glcm_features:dict[str,np.array]) -> float:
+    contrast = glcm_features["contrast"]
+    per_angle_contrast = contrast.mean(axis=0)  # (n_angles,)
+    mean_val = float(per_angle_contrast.mean())
+    if mean_val < 1e-8:
         return 0.0
-    gx = np.gradient(gray, axis=1)
-    gy = np.gradient(gray, axis=0)
-    angles = np.arctan2(gy, gx)
-    hist, _ = np.histogram(angles, bins=36, range=(-np.pi, np.pi))
-    hist = hist.astype(np.float32)
-    if hist.sum() == 0:
-        return 0.0
-    hist /= hist.sum()
-    entropy = -np.sum(hist * np.log(hist + 1e-9))
-    max_entropy = np.log(36)
-    return float(1.0 - entropy / max_entropy)
+    directional_var = float(np.std(per_angle_contrast) / (mean_val + 1e-8))
+    return float(np.clip(directional_var, 0.0, 1.0))
 
 
 def compute_frequency_descriptor(gray: np.ndarray) -> float:
@@ -70,11 +78,9 @@ def compute_frequency_descriptor(gray: np.ndarray) -> float:
 
 def map_features(features: dict[str, np.ndarray]) -> TactileDescriptor:
     """Convert preprocessed feature maps to a TactileDescriptor."""
+    glcm_features = compute_glcm_features(features["gray"])
     return TactileDescriptor(
-        roughness=compute_roughness(features["frequency"]),
-        directionality=compute_directionality(
-            orientation_strength=features.get("orientation_strength"),
-            gray=features["gray"],
-        ),
+        roughness=compute_roughness(glcm_features),
+        directionality=compute_directionality(glcm_features),
         frequency=compute_frequency_descriptor(features["gray"]),
     )
