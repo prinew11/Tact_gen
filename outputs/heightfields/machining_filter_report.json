@@ -9,17 +9,17 @@
   ],
   "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
-  "terrace_steps_applied": 11,
-  "step_height_mm": 1.0,
-  "plateau_fraction": 0.9472991517466636,
+  "terrace_steps_applied": 17,
+  "step_height_mm": 0.625,
+  "plateau_fraction": 0.8640387130945598,
   "max_plateau_slope_deg": 0.0,
-  "max_raw_slope_deg": 75.74295043945312,
+  "max_raw_slope_deg": 73.96112060546875,
   "min_feature_target_mm": 6.0,
   "morph_radius_px": 10.559999999999999,
   "passed": true,
   "issues": [],
   "recommendations": [
     "Downsampled 512\u2192353 px for face budget",
-    "11 terrace levels, step height 1.00 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 94.7%."
+    "17 terrace levels, step height 0.62 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 86.4%."
   ]
 }

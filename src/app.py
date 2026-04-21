@@ -107,7 +107,6 @@ def run_diffusion(image: np.ndarray | None, steps: int):
         hf_raw_path = OUT / "heightfields" / "heightfield_raw.npy"
         hf_raw_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(hf_raw_path), hf)
-        np.save(str(OUT / "heightfields" / "heightfield.npy"), hf)
 
         info = "\n".join([
             f"**Diffusion 模块测试通过（使用本地训练模型）**\n",

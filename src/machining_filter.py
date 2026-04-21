@@ -39,12 +39,15 @@ class MachiningFilterConfig:
     tool_radius_mm: float = 3.0         # 6 mm ball end mill
     max_slope_deg: float = 45.0         # plateau-only slope target
     face_limit: int = 500_000
-    # terrace_steps = 0 → auto from physical_size / (tool_diameter * factor)
+    # terrace_steps = 0 → auto from max_height_mm / min_step_height_mm
     # terrace_steps = 1 → disable quantisation entirely (debug only)
     terrace_steps: int = 0
-    # Lower factor → more levels → finer gradation but smaller plateaus.
-    # 1.0 gives ~17 levels at 100 mm / 6 mm tool (~0.6 mm per step over 10 mm).
-    target_min_feature_factor: float = 1.0
+    # Z-axis quantisation step.  Tool diameter only constrains XY features
+    # (handled by morph opening); Z resolution is limited by machine precision,
+    # not tool width.  0.2 mm gives 50 levels over a 10 mm relief — fine enough
+    # to preserve nearly all perceptible height detail while keeping plateaus
+    # large enough for clean flat-end-mill finishing.
+    min_step_height_mm: float = 0.2
 
 
 @dataclass
@@ -166,11 +169,9 @@ def filter_heightfield_for_machining(
 
     # --- 4. ADC quantisation (hard steps, no softening) ---
     if config.terrace_steps == 0:
-        tool_diameter_mm = config.tool_radius_mm * 2.0
         n_levels = max(
             2,
-            round(config.physical_size_mm /
-                  (tool_diameter_mm * config.target_min_feature_factor)),
+            round(config.max_height_mm / config.min_step_height_mm),
         )
     else:
         n_levels = max(1, config.terrace_steps)
