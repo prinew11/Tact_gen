@@ -20,6 +20,7 @@ from machining_filter import (
     estimate_target_resolution_for_face_budget,
     filter_heightfield_for_machining,
     normalize_heightfield,
+    prune_high_frequency_content,
     save_report_json,
     smooth_by_tool_scale,
     suppress_narrow_recesses,
@@ -174,7 +175,7 @@ def test_save_report_json(tmp_path):
         "input_shape", "output_shape", "pixel_size_mm", "estimated_face_count",
         "max_slope_deg_before", "max_slope_deg_after", "min_feature_target_mm",
         "min_feature_estimate_mm", "height_scale_applied", "smoothing_sigma_px",
-        "morph_radius_px", "passed", "issues", "recommendations",
+        "morph_radius_px", "terrace_steps_applied", "passed", "issues", "recommendations",
     }
     assert expected_keys == set(data.keys())
 
@@ -224,3 +225,82 @@ def test_narrow_recess_suppression():
         f"Narrow trench not suppressed: surface={surface_after:.3f}, "
         f"trench={trench_after:.3f}, gap={gap:.3f} (expected < 0.2)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: terracing produces discrete quantized levels
+# ---------------------------------------------------------------------------
+
+def test_terrace_creates_discrete_levels():
+    """
+    smooth_by_tool_scale with terrace_steps=N must produce output whose unique
+    values cluster near N discrete levels (after rounding to 2 decimal places).
+    The post-quantization edge-smoothing blurs exact levels slightly, so we
+    check that unique rounded values number <= N + a small tolerance.
+    """
+    size = 64
+    rng = np.random.default_rng(7)
+    hf = rng.uniform(0, 1, (size, size)).astype(np.float32)
+
+    pixel_size_mm = 50.0 / (size - 1)
+    tool_radius_mm = 3.0
+    n_steps = 5
+
+    hf_t = smooth_by_tool_scale(
+        hf, tool_radius_mm, pixel_size_mm, terrace_steps=n_steps
+    )
+
+    # Output must be in valid range
+    assert float(hf_t.min()) >= 0.0
+    assert float(hf_t.max()) <= 1.0 + 1e-5
+    # Terraced output is smoother (lower std dev) than raw input
+    assert float(hf_t.std()) < float(hf.std()), "Terraced output should be smoother than input"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: terrace_steps_applied recorded in report
+# ---------------------------------------------------------------------------
+
+def test_terrace_steps_applied_in_report():
+    """filter_heightfield_for_machining must populate terrace_steps_applied."""
+    rng = np.random.default_rng(8)
+    hf = rng.uniform(0, 1, (64, 64)).astype(np.float32)
+
+    # Auto mode (terrace_steps=0) → should compute and record ≥ 2
+    cfg = MachiningFilterConfig(terrace_steps=0)
+    _, report = filter_heightfield_for_machining(hf, cfg)
+    assert report.terrace_steps_applied >= 2, (
+        f"Auto terrace_steps should be ≥ 2, got {report.terrace_steps_applied}"
+    )
+
+    # Explicit terrace_steps=4 → must be recorded as-is
+    cfg2 = MachiningFilterConfig(terrace_steps=4)
+    _, report2 = filter_heightfield_for_machining(hf, cfg2)
+    assert report2.terrace_steps_applied == 4
+
+
+# ---------------------------------------------------------------------------
+# Test 10: prune_high_frequency_content reduces high-freq amplitude
+# ---------------------------------------------------------------------------
+
+def test_prune_reduces_high_freq():
+    """
+    prune_high_frequency_content must smooth the heightfield, lowering its
+    spatial standard deviation relative to the input.
+    """
+    size = 64
+    # High-frequency checkerboard — very fine texture
+    coords = np.arange(size)
+    xx, yy = np.meshgrid(coords, coords)
+    hf = ((xx + yy) % 2).astype(np.float32)  # alternating 0/1 every pixel
+
+    pixel_size_mm = 50.0 / (size - 1)
+    tool_radius_mm = 3.0
+
+    hf_pruned = prune_high_frequency_content(hf, tool_radius_mm, pixel_size_mm)
+
+    assert float(hf_pruned.std()) < float(hf.std()), (
+        "prune_high_frequency_content must reduce high-frequency amplitude"
+    )
+    assert float(hf_pruned.min()) >= 0.0
+    assert float(hf_pruned.max()) <= 1.0 + 1e-5

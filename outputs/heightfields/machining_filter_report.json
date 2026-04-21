@@ -1,0 +1,27 @@
+{
+  "input_shape": [
+    512,
+    512
+  ],
+  "output_shape": [
+    353,
+    353
+  ],
+  "pixel_size_mm": 1.4204545454545454,
+  "estimated_face_count": 498432,
+  "max_slope_deg_before": 69.19683074951172,
+  "max_slope_deg_after": 29.070249557495117,
+  "min_feature_target_mm": 6.0,
+  "min_feature_estimate_mm": 6.0,
+  "height_scale_applied": 0.658203125,
+  "smoothing_sigma_px": 2.112,
+  "morph_radius_px": 2.112,
+  "terrace_steps_applied": 56,
+  "passed": true,
+  "issues": [],
+  "recommendations": [
+    "Downsampled 512\u2192353 px to satisfy face budget",
+    "Sub-6 mm recesses suppressed via morphological opening (tool diameter 6.0 mm)",
+    "Height compressed to 0.66\u00d7 (13.16 mm effective). Scale is embedded in the saved heightfield \u2014 use max_height_mm as-is."
+  ]
+}
