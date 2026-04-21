@@ -134,7 +134,8 @@ def run_diffusion(image: np.ndarray | None, steps: int):
 # ===== 3.5 Fabrication Correction ==========================================
 
 def run_fabrication_correction(heightfield_file, physical_size, max_height,
-                               tool_radius, max_slope, material_hint):
+                               tool_radius, max_slope, material_hint,
+                               apply_machining_filter=False):
     try:
         if heightfield_file is not None:
             hf = np.load(heightfield_file)
@@ -520,8 +521,7 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 3.5: Fabrication Correction ----
         with gr.Tab("3.5 Fabrication Correction"):
-            gr.Markdown("对高度场进行加工约束修正：坡度限制、最小特征尺寸、形态学滤波\n\n"
-                        "基于 Memory Store (RAG) 检索加工知识并自适应修正。")
+            gr.Markdown("对高度场进行加工约束修正：坡度限制、最小特征尺寸、形态学滤波")
             inp_corr_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             with gr.Row():
                 inp_corr_size = gr.Number(label="Physical size (mm)", value=50.0)
@@ -529,6 +529,7 @@ def build_app() -> gr.Blocks:
                 inp_corr_tr = gr.Number(label="Tool radius (mm)", value=3.0)
             inp_corr_slope = gr.Slider(20, 60, value=45, step=1, label="最大坡度 (°)")
             inp_corr_mat = gr.Textbox(label="材料提示 (可选)", placeholder="e.g. wood, bark, concrete")
+            inp_corr_filter = gr.Checkbox(label="应用机加工滤波 (machining filter)", value=False)
             btn_corr = gr.Button("运行 Fabrication Correction", variant="primary")
             with gr.Row():
                 out_corr_before = gr.Image(label="修正前高度场")
@@ -545,8 +546,8 @@ def build_app() -> gr.Blocks:
             btn_corr.click(
                 run_fabrication_correction,
                 inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_slope, inp_corr_mat],
-                outputs=[out_corr_before, out_corr_after, out_corr_info],
+                        inp_corr_slope, inp_corr_mat, inp_corr_filter],
+                outputs=[out_corr_before, out_corr_after, out_corr_info, out_corr_filter_json],
             )
 
         # ---- Tab 4: Geometry ----
@@ -568,7 +569,7 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 5: Mockup ----
         with gr.Tab("5. Mockup (OBJ)"):
-            gr.Markdown("加载 .npy 高度场 → 256×256 低精度 OBJ 预览（Z×2）")
+            gr.Markdown("加载 .npy 高度场 → 256*256 低精度 OBJ 预览)")
             inp_moc_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             with gr.Row():
                 inp_moc_size = gr.Number(label="Physical size (mm)", value=50.0)
