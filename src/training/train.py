@@ -1,27 +1,19 @@
 """
 Conditional DDPM training: diffuse RGB -> heightmap.
 
-The U-Net receives a 4-channel tensor [noisy_height, diffuse_rgb] and predicts
-the noise that was added to the heightmap (epsilon-prediction). At inference
-the diffuse image is kept fixed across all denoising steps and DDIM sampling
-produces the heightmap.
+Splits the dataset into train / val / test. Only the final EMA
+checkpoint is saved. Per-epoch train & val losses are tracked and a
+loss curve is saved to <output_dir>/loss_curve.png at the end.
 
 Usage (from src/training):
     python train.py --data_root "D:/homework/lund/CS_project/dataset_resize" \
-                    --output_dir "D:/homework/lund/CS_project/Tact_gen/checkpoints" \
+                    --output_dir "D:/homework/lund/CS_project/Tact_gen/models" \
                     --epochs 200 --batch_size 4 --image_size 256
-
-Resume:
-    python train.py ... --resume "D:/.../checkpoints/latest"
-
-The final EMA checkpoint is saved to <output_dir>/final/ and a copy is also
-kept at <output_dir>/latest/ for easy loading.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -37,6 +29,8 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from dataset import PairedTextureDataset  # noqa: E402
+from losses import fabrication_aware_loss  # noqa: E402
+from cnc_params import MAX_SLOPE_PX, MIN_FEAT_PX  # noqa: E402
 
 
 def build_model(image_size: int):
@@ -47,15 +41,15 @@ def build_model(image_size: int):
         in_channels=4,
         out_channels=1,
         layers_per_block=2,
-        block_out_channels=(64, 128, 256, 512),
+        block_out_channels=(32, 64, 128, 256),
         down_block_types=(
             "DownBlock2D",
             "DownBlock2D",
             "DownBlock2D",
-            "AttnDownBlock2D",
+            "DownBlock2D",
         ),
         up_block_types=(
-            "AttnUpBlock2D",
+            "UpBlock2D",
             "UpBlock2D",
             "UpBlock2D",
             "UpBlock2D",
@@ -74,7 +68,7 @@ def build_scheduler(num_train_timesteps: int = 1000):
     )
 
 
-def save_checkpoint(
+def save_model(
     out_dir: Path,
     model,
     scheduler,
@@ -107,51 +101,56 @@ class SimpleEMA:
     def state_dict(self) -> dict:
         return {k: v.detach().cpu() for k, v in self.shadow.items()}
 
-    def load_state_dict(self, state: dict) -> None:
-        for k, v in state.items():
-            if k in self.shadow:
-                self.shadow[k].copy_(v.to(self.shadow[k].device))
-
     def copy_to(self, model: torch.nn.Module) -> None:
         model.load_state_dict({k: v.to(next(model.parameters()).device) for k, v in self.shadow.items()})
 
 
 @torch.no_grad()
-def sample_preview(model, scheduler, diffuse_t: torch.Tensor, num_steps: int = 50, device: str = "cuda"):
-    from diffusers import DDIMScheduler
-
-    ddim = DDIMScheduler.from_config(scheduler.config)
-    ddim.set_timesteps(num_steps)
-    b, _, h, w = diffuse_t.shape
-    height_t = torch.randn((b, 1, h, w), device=device)
+def compute_eval_loss(model, scheduler, loader, device: str) -> float:
+    """Average epsilon-MSE over a dataloader at random timesteps."""
     model.eval()
-    for t in ddim.timesteps:
-        inp = torch.cat([height_t, diffuse_t], dim=1)
-        pred = model(inp, t).sample
-        height_t = ddim.step(pred, t, height_t).prev_sample
+    total = 0.0
+    n = 0
+    for diffuse, height in loader:
+        diffuse = diffuse.to(device, non_blocking=True)
+        height = height.to(device, non_blocking=True)
+        bsz = height.shape[0]
+        timesteps = torch.randint(
+            0, scheduler.config.num_train_timesteps, (bsz,), device=device
+        ).long()
+        noise = torch.randn_like(height)
+        noisy_height = scheduler.add_noise(height, noise, timesteps)
+        model_in = torch.cat([noisy_height, diffuse], dim=1)
+        pred = model(model_in, timesteps).sample
+        loss = F.mse_loss(pred, noise)
+        total += loss.item() * bsz
+        n += bsz
     model.train()
-    return height_t
+    return total / max(1, n)
 
 
-def save_preview_grid(out_path: Path, diffuse_t: torch.Tensor, height_pred: torch.Tensor, height_gt: torch.Tensor) -> None:
+def plot_loss_curves(
+    train_losses: list[float],
+    val_losses: list[float],
+    test_loss: float | None,
+    out_path: Path,
+) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    d = (diffuse_t.clamp(-1, 1).cpu().numpy() + 1) / 2
-    hp = (height_pred.clamp(-1, 1).cpu().numpy() + 1) / 2
-    hg = (height_gt.clamp(-1, 1).cpu().numpy() + 1) / 2
-    n = d.shape[0]
-    fig, ax = plt.subplots(n, 3, figsize=(9, 3 * n))
-    if n == 1:
-        ax = ax[None, :]
-    for i in range(n):
-        ax[i, 0].imshow(np.transpose(d[i], (1, 2, 0)))
-        ax[i, 0].set_title("diffuse"); ax[i, 0].axis("off")
-        ax[i, 1].imshow(hp[i, 0], cmap="gray", vmin=0, vmax=1)
-        ax[i, 1].set_title("pred height"); ax[i, 1].axis("off")
-        ax[i, 2].imshow(hg[i, 0], cmap="gray", vmin=0, vmax=1)
-        ax[i, 2].set_title("gt height"); ax[i, 2].axis("off")
+    epochs = list(range(1, len(train_losses) + 1))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, train_losses, label="train", linewidth=2)
+    ax.plot(epochs, val_losses, label="val", linewidth=2)
+    if test_loss is not None:
+        ax.axhline(test_loss, color="red", linestyle="--",
+                   label=f"test (final): {test_loss:.4f}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE loss (epsilon-prediction)")
+    ax.set_title("Conditional DDPM training curves")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120)
@@ -160,19 +159,17 @@ def save_preview_grid(out_path: Path, diffuse_t: torch.Tensor, height_pred: torc
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="D:/homework/lund/CS_project/dataset_resize")
-    p.add_argument("--output_dir", default="D:/homework/lund/CS_project/Tact_gen/checkpoints")
-    p.add_argument("--image_size", type=int, default=256)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--data_root", default="D:/homework/lund/CS_project/dataset_processed")
+    p.add_argument("--output_dir", default="D:/homework/lund/CS_project/Tact_gen/models")
+    p.add_argument("--image_size", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--save_every", type=int, default=20)
-    p.add_argument("--preview_every", type=int, default=10)
-    p.add_argument("--val_fraction", type=float, default=0.05)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--ema_decay", type=float, default=0.999)
+    p.add_argument("--val_fraction", type=float, default=0.10)
+    p.add_argument("--test_fraction", type=float, default=0.10)
+    p.add_argument("--seed", type=int, default=66)
+    p.add_argument("--ema_decay", type=float, default=0.9995)
     p.add_argument("--num_timesteps", type=int, default=1000)
     args = p.parse_args()
 
@@ -183,16 +180,20 @@ def main():
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Split into train / val / test
     full_dataset = PairedTextureDataset(args.data_root, image_size=args.image_size, train=True)
+    eval_dataset = PairedTextureDataset(args.data_root, image_size=args.image_size, train=False)
     n_total = len(full_dataset)
     n_val = max(4, int(n_total * args.val_fraction))
-    n_train = n_total - n_val
+    n_test = max(4, int(n_total * args.test_fraction))
+    n_train = n_total - n_val - n_test
     gen = torch.Generator().manual_seed(args.seed)
-    train_ds, val_ds = random_split(full_dataset, [n_train, n_val], generator=gen)
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    # Val / test use the eval-mode dataset (no augmentation) via shared indices
+    val_ds.dataset = eval_dataset
+    test_ds.dataset = eval_dataset
 
-    val_ds.dataset = PairedTextureDataset(args.data_root, image_size=args.image_size, train=False)
-
-    print(f"Dataset: total={n_total}  train={n_train}  val={n_val}")
+    print(f"Dataset: total={n_total}  train={n_train}  val={n_val}  test={n_test}")
     print(f"Device: {device}")
 
     train_loader = DataLoader(
@@ -203,50 +204,40 @@ def main():
         pin_memory=(device == "cuda"),
         drop_last=True,
     )
-    val_loader = DataLoader(val_ds, batch_size=min(4, n_val), shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = build_model(args.image_size).to(device)
+
     scheduler = build_scheduler(args.num_timesteps)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-6)
-
     ema = SimpleEMA(model, decay=args.ema_decay)
-
-    start_epoch = 0
-    if args.resume:
-        from diffusers import UNet2DModel, DDPMScheduler  # noqa: F401
-
-        resume_dir = Path(args.resume)
-        model = build_model(args.image_size)
-        model.load_state_dict(UNet2DModel.from_pretrained(resume_dir).state_dict())
-        model.to(device)
-        ema = SimpleEMA(model, decay=args.ema_decay)
-        ema_path = resume_dir / "ema.pt"
-        if ema_path.exists():
-            ema.load_state_dict(torch.load(ema_path, map_location=device))
-        meta_path = resume_dir / "train_meta.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                meta = json.load(f)
-            start_epoch = int(meta.get("epoch", 0))
-        print(f"Resumed from {resume_dir} at epoch {start_epoch}")
 
     use_amp = device == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    preview_batch = next(iter(val_loader))
-    preview_diffuse = preview_batch[0].to(device)
-    preview_gt = preview_batch[1].to(device)
-
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    slope_losses: list[float] = []
+    feat_losses: list[float] = []
+    alphas_cumprod = scheduler.alphas_cumprod
     global_step = 0
-    for epoch in range(start_epoch, args.epochs):
+
+    for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_slope = 0.0
+        epoch_feat = 0.0
+        n_batches = 0
         t_start = time.time()
         for step, (diffuse, height) in enumerate(train_loader):
             diffuse = diffuse.to(device, non_blocking=True)
             height = height.to(device, non_blocking=True)
             bsz = height.shape[0]
-            timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,), device=device).long()
+            timesteps = torch.randint(
+                0, scheduler.config.num_train_timesteps, (bsz,), device=device
+            ).long()
             noise = torch.randn_like(height)
             noisy_height = scheduler.add_noise(height, noise, timesteps)
             model_in = torch.cat([noisy_height, diffuse], dim=1)
@@ -254,7 +245,16 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 pred = model(model_in, timesteps).sample
-                loss = F.mse_loss(pred, noise)
+                loss, parts = fabrication_aware_loss(
+                    pred_noise=pred,
+                    target_noise=noise,
+                    noisy_h=noisy_height,
+                    alphas_cumprod=alphas_cumprod,
+                    timesteps=timesteps,
+                    max_slope_px=MAX_SLOPE_PX,
+                    min_feat_px=MIN_FEAT_PX,
+                    current_step=global_step,
+                )
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -268,54 +268,79 @@ def main():
                 optimizer.step()
 
             ema.update(model)
-            epoch_loss += loss.item()
-            global_step += 1
+            epoch_loss += parts["total"]
+            epoch_mse += parts["mse"]
+            epoch_slope += parts["slope"]
+            epoch_feat += parts["feat"]
+            n_batches += 1
             if step % 20 == 0:
-                print(f"  ep {epoch+1:03d} step {step:04d}/{len(train_loader):04d}  loss={loss.item():.4f}")
+                print(
+                    f"  ep {epoch+1:03d} step {step:04d}/{len(train_loader):04d}  "
+                    f"total={parts['total']:.4f}  mse={parts['mse']:.4f}  "
+                    f"slope={parts['slope']:.4f}  feat={parts['feat']:.4f}"
+                )
+            global_step += 1
+
+        mean_train_loss = epoch_loss / max(1, n_batches)
+        mean_slope_loss = epoch_slope / max(1, n_batches)
+        mean_feat_loss = epoch_feat / max(1, n_batches)
+
+        # Evaluate on val set (with EMA weights)
+        ema_model = build_model(args.image_size).to(device)
+        ema.copy_to(ema_model)
+        mean_val_loss = compute_eval_loss(ema_model, scheduler, val_loader, device)
+        del ema_model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        train_losses.append(mean_train_loss)
+        val_losses.append(mean_val_loss)
+        slope_losses.append(mean_slope_loss)
+        feat_losses.append(mean_feat_loss)
 
         dt = time.time() - t_start
-        mean_loss = epoch_loss / max(1, len(train_loader))
-        print(f"Epoch {epoch+1:03d}/{args.epochs}  mean_loss={mean_loss:.4f}  elapsed={dt:.1f}s")
+        print(f"Epoch {epoch+1:03d}/{args.epochs}  "
+              f"train_loss={mean_train_loss:.4f}  val_loss={mean_val_loss:.4f}  "
+              f"slope={mean_slope_loss:.4f}  feat={mean_feat_loss:.4f}  "
+              f"elapsed={dt:.1f}s")
 
-        if (epoch + 1) % args.preview_every == 0 or (epoch + 1) == args.epochs:
-            ema_model = build_model(args.image_size).to(device)
-            ema.copy_to(ema_model)
-            preds = sample_preview(ema_model, scheduler, preview_diffuse, num_steps=25, device=device)
-            save_preview_grid(
-                out / "previews" / f"epoch_{epoch+1:03d}.png",
-                preview_diffuse, preds, preview_gt,
-            )
-            del ema_model
-            if device == "cuda":
-                torch.cuda.empty_cache()
-
-        if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
-            ema_model = build_model(args.image_size).to(device)
-            ema.copy_to(ema_model)
-            meta = {
-                "epoch": epoch + 1,
-                "mean_loss": mean_loss,
-                "image_size": args.image_size,
-                "num_timesteps": args.num_timesteps,
-                "ema_decay": args.ema_decay,
-            }
-            # save_checkpoint(out / f"ckpt_epoch{epoch+1:03d}", ema_model, scheduler, ema.state_dict(), meta)
-            save_checkpoint(out / "latest", ema_model, scheduler, ema.state_dict(), meta)
-            del ema_model
-            if device == "cuda":
-                torch.cuda.empty_cache()
-
+    # Final test evaluation
     ema_model = build_model(args.image_size).to(device)
     ema.copy_to(ema_model)
-    save_checkpoint(
-        out / "final", ema_model, scheduler, ema.state_dict(),
-        {"epoch": args.epochs, "image_size": args.image_size, "num_timesteps": args.num_timesteps},
+    test_loss = compute_eval_loss(ema_model, scheduler, test_loader, device)
+    print(f"\nFinal test loss: {test_loss:.4f}")
+
+    # Save final checkpoint only
+    save_model(
+        out / "improved", ema_model, scheduler, ema.state_dict(),
+        {
+            "epoch": args.epochs,
+            "image_size": args.image_size,
+            "num_timesteps": args.num_timesteps,
+            "final_train_loss": train_losses[-1] if train_losses else None,
+            "final_val_loss": val_losses[-1] if val_losses else None,
+            "test_loss": test_loss,
+        },
     )
-    save_checkpoint(
-        out / "latest", ema_model, scheduler, ema.state_dict(),
-        {"epoch": args.epochs, "image_size": args.image_size, "num_timesteps": args.num_timesteps},
-    )
-    print(f"Done. Final checkpoint: {out/'final'}")
+    del ema_model
+
+    # Save loss log + plot
+    with open(out / "loss_log.json", "w") as f:
+        json.dump(
+            {
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "slope_losses": slope_losses,
+                "feat_losses": feat_losses,
+                "test_loss": test_loss,
+            },
+            f,
+            indent=2,
+        )
+    plot_loss_curves(train_losses, val_losses, test_loss, out / "loss_curve.png")
+
+    print(f"Done. Final checkpoint: {out/'improved'}")
+    print(f"Loss curve: {out/'loss_curve.png'}")
 
 
 if __name__ == "__main__":

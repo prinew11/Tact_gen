@@ -2,7 +2,7 @@
 Heightfield generation pipeline: input image → single-channel heightfield.
 
 Uses the locally trained conditional DDPM checkpoint at
-``<project_root>/checkpoints/latest`` by default. No text prompt, no
+``<project_root>/models/improved`` by default. No text prompt, no
 TactileDescriptor — the trained model learns the diffuse → height mapping
 end-to-end from paired data.
 """
@@ -20,14 +20,14 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 
-_DEFAULT_TRAINED_CKPT = Path(__file__).resolve().parents[1] / "checkpoints" / "final"
+_DEFAULT_TRAINED_CKPT = Path(__file__).resolve().parents[1] / "models" / "improved"
 
 
 @dataclass
 class DiffusionConfig:
     trained_model_path: str = str(_DEFAULT_TRAINED_CKPT)
     num_inference_steps: int = 50
-    seed: int = 42
+    seed: int = 20
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     output_size: tuple[int, int] = (512, 512)
 

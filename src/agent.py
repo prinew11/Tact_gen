@@ -14,14 +14,13 @@ class PipelineConfig:
     physical_size_mm: float = 50.0
     max_height_mm: float = 5.0
     tool_radius_mm: float = 0.5
-    material_hint: str | None = None
+    max_slope_deg: float = 45.0
 
 
 def run_pipeline(config: PipelineConfig) -> None:
     from preprocessing import preprocess
     from tactile_mapping import map_features
     from diffusion_pipeline import DiffusionConfig, generate_heightfield, save_heightfield
-    from memory_store import MemoryStore
     from fabrication_corrector import (
         CorrectionConfig,
         correct_heightfield,
@@ -32,7 +31,6 @@ def run_pipeline(config: PipelineConfig) -> None:
     from fabrication import FabricationConfig, check_mesh, print_report
 
     out = Path(config.output_dir)
-    store = MemoryStore()
 
     print("=== Stage 1: Preprocessing ===")
     features = preprocess(config.input_image)
@@ -48,17 +46,16 @@ def run_pipeline(config: PipelineConfig) -> None:
     save_heightfield(heightfield, hf_raw_path)
     print(f"  Raw heightfield saved: {hf_raw_path}")
 
-    print("=== Stage 3.5: Memory-driven fabrication correction ===")
+    print("=== Stage 3.5: Fabrication correction ===")
     corr_cfg = CorrectionConfig(
         physical_size_mm=config.physical_size_mm,
         max_height_mm=config.max_height_mm,
         tool_radius_mm=config.tool_radius_mm,
+        max_slope_deg=config.max_slope_deg,
     )
-    heightfield, corr_report = correct_heightfield(
-        heightfield, corr_cfg, store=store, material_hint=config.material_hint
-    )
+    heightfield, corr_report = correct_heightfield(heightfield, corr_cfg)
     print_correction_report(corr_report)
-    hf_path = out / "heightfields" / "heightfield.npy"
+    hf_path = out / "heightfields" / "heightfield_corrected.npy"
     save_heightfield(heightfield, hf_path)
     print(f"  Corrected heightfield saved: {hf_path}")
 
@@ -72,7 +69,12 @@ def run_pipeline(config: PipelineConfig) -> None:
     save_stl(mesh, stl_path)
 
     print("=== Stage 5: Fabrication check ===")
-    fab_cfg = FabricationConfig(tool_radius_mm=config.tool_radius_mm)
+    fab_cfg = FabricationConfig(
+        tool_radius_mm=config.tool_radius_mm,
+        max_slope_deg=config.max_slope_deg,
+        physical_size_mm=config.physical_size_mm,
+        max_height_mm=config.max_height_mm,
+    )
     report = check_mesh(mesh, fab_cfg)
     print_report(report)
 
@@ -94,9 +96,8 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python agent.py <input_image> [material_hint]")
+        print("Usage: python agent.py <input_image>")
         sys.exit(1)
 
-    material = sys.argv[2] if len(sys.argv) > 2 else None
-    cfg = PipelineConfig(input_image=sys.argv[1], material_hint=material)
+    cfg = PipelineConfig(input_image=sys.argv[1])
     run_pipeline(cfg)

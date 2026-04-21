@@ -1,6 +1,6 @@
 .claude/
 .vscode/
-checkpoints/
+models/
 *.zip
 *.pth
 *.bin

@@ -167,7 +167,7 @@ def run_diffusion(image: np.ndarray | None, steps: int, apply_filter: bool = Fal
 # ===== 3.5 Fabrication Correction ==========================================
 
 def run_fabrication_correction(heightfield_file, physical_size, max_height,
-                               tool_radius, max_slope, material_hint):
+                               tool_radius, max_slope):
     try:
         if heightfield_file is not None:
             hf = np.load(heightfield_file)
@@ -178,10 +178,8 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
             else:
                 hf = np.load(str(default))
 
-        from fabrication_corrector import CorrectionConfig, correct_heightfield, print_correction_report
-        from memory_store import MemoryStore
+        from fabrication_corrector import CorrectionConfig, correct_heightfield
 
-        store = MemoryStore()
         config = CorrectionConfig(
             physical_size_mm=float(physical_size),
             max_height_mm=float(max_height),
@@ -189,10 +187,9 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
             max_slope_deg=float(max_slope),
             resolution=hf.shape[0],
         )
-        mat = material_hint.strip() if material_hint and material_hint.strip() else None
 
         t0 = time.time()
-        hf_corrected, report = correct_heightfield(hf, config, store=store, material_hint=mat)
+        hf_corrected, report = correct_heightfield(hf, config)
         elapsed = time.time() - t0
 
         corr_path = OUT / "heightfields" / "heightfield_corrected.npy"
@@ -208,7 +205,6 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
             f"- 形态学修改像素: {report.morph_pixels_changed:,}\n"
             f"- 传播扫描次数: {report.propagation_sweeps_used}\n"
             f"- 应用约束: {', '.join(report.constraints_applied)}\n"
-            f"- 语义指导: {', '.join(report.guidance_used)}\n"
             f"- 已保存: `{corr_path.relative_to(ROOT)}`"
         )
         return _arr_to_uint8(hf), _arr_to_uint8(hf_corrected), info
@@ -527,14 +523,13 @@ def build_app() -> gr.Blocks:
         # ---- Tab 3.5: Fabrication Correction ----
         with gr.Tab("3.5 Fabrication Correction"):
             gr.Markdown("对高度场进行加工约束修正：坡度限制、最小特征尺寸、形态学滤波\n\n"
-                        "基于 Memory Store (RAG) 检索加工知识并自适应修正。")
+                        "形态学开运算 + 约束传播 + 高斯平滑")
             inp_corr_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             with gr.Row():
                 inp_corr_size = gr.Number(label="Physical size (mm)", value=50.0)
                 inp_corr_h = gr.Number(label="Max height (mm)", value=5.0)
                 inp_corr_tr = gr.Number(label="Tool radius (mm)", value=3.0)
             inp_corr_slope = gr.Slider(20, 60, value=45, step=1, label="最大坡度 (°)")
-            inp_corr_mat = gr.Textbox(label="材料提示 (可选)", placeholder="e.g. wood, bark, concrete")
             btn_corr = gr.Button("运行 Fabrication Correction", variant="primary")
             with gr.Row():
                 out_corr_before = gr.Image(label="修正前高度场")
@@ -543,7 +538,7 @@ def build_app() -> gr.Blocks:
             btn_corr.click(
                 run_fabrication_correction,
                 inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_slope, inp_corr_mat],
+                        inp_corr_slope],
                 outputs=[out_corr_before, out_corr_after, out_corr_info],
             )
 

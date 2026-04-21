@@ -14,9 +14,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sys
+
 import cv2
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter
+
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+from cnc_params import FEATURE_SIGMA, MAX_SLOPE_PX  # noqa: E402
+
+
+def _enforce_machinability(h: np.ndarray) -> np.ndarray:
+    h = gaussian_filter(h, sigma=FEATURE_SIGMA)
+    slope_limit = MAX_SLOPE_PX * 0.85
+    for _ in range(20):
+        gx = np.gradient(h, axis=1)
+        gy = np.gradient(h, axis=0)
+        slope = np.sqrt(gx * gx + gy * gy)
+        mask = slope > slope_limit
+        if not mask.any():
+            break
+        blurred = gaussian_filter(h, sigma=1.5)
+        h = np.where(mask, blurred, h)
+    lo, hi = float(h.min()), float(h.max())
+    if hi - lo > 1e-6:
+        h = (h - lo) / (hi - lo)
+    else:
+        h = np.zeros_like(h)
+    return h.astype(np.float32)
 
 
 def _round_to_multiple(x: int, m: int = 8) -> int:
@@ -45,6 +74,7 @@ class TrainedHeightfieldModel:
         eta: float = 0.0,
         seed: int | None = None,
         output_size: tuple[int, int] | None = None,
+        enforce_machinability: bool = True,
     ) -> np.ndarray:
         """
         diffuse_rgb: (H, W, 3) uint8 OR float32 in [0, 1].
@@ -91,4 +121,6 @@ class TrainedHeightfieldModel:
         h = np.clip(h, 0.0, 1.0).astype(np.float32)
         if (H8, W8) != (out_h, out_w):
             h = cv2.resize(h, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        if enforce_machinability:
+            h = _enforce_machinability(h)
         return h
