@@ -74,7 +74,7 @@ class TrainedHeightfieldModel:
         eta: float = 0.0,
         seed: int | None = None,
         output_size: tuple[int, int] | None = None,
-        enforce_machinability: bool = True,
+        enforce_machinability: bool = False,
     ) -> np.ndarray:
         """
         diffuse_rgb: (H, W, 3) uint8 OR float32 in [0, 1].

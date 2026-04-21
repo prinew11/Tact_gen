@@ -17,36 +17,47 @@ CAD model after design.
 
 ```
 Input image
-  └─ Preprocessing
-  └─ Tactile mapping
-  └─ Diffusion → heightfield_raw.npy
-  └─ Fabrication corrector (memory-RAG) → heightfield_corrected.npy
-  └─ Machining filter (deterministic)   → heightfield_machinable.npy
-  └─ Geometry → tactile.stl
-  └─ Fabrication check
+  └─ Diffusion (DDPM)            → heightfield.npy
+  └─ Machining filter (ADC)      → heightfield_machinable.npy
+  └─ Geometry                    → tactile.stl
+  └─ Mockup (preview)            → preview.obj
+  └─ Fabrication check           → PASS / FAIL report
 ```
+
+### Machining filter: ADC-style quantisation
+
+Rather than blurring slopes away, the filter **quantises heights into discrete
+terrace levels** (like an ADC). Relief becomes a stack of flat plateaus joined
+by near-vertical risers. Two benefits:
+
+- **Plateaus have 0° slope** — trivially machinable.
+- **Risers are ~90°** — machinable by the side of a ball-end mill. A 3-axis
+  mill handles vertical walls fine; only undercuts (>90°) fail.
+
+Pipeline inside the filter:
+
+1. Normalise to [0, 1]
+2. Downsample if needed to stay under the Fusion face budget
+3. Mild Gaussian to prune sub-tool-scale noise
+4. Morphological opening to kill grooves narrower than the tool diameter
+5. Hard ADC quantisation into N discrete levels (no riser softening)
 
 ### Hard manufacturability constraint: 6 mm tool diameter
 
-The default milling tool is a **6 mm diameter ball-end mill** (radius = 3 mm).
+Default tool is a **6 mm diameter ball-end mill** (radius = 3 mm). Any groove
+or concavity narrower than 6 mm cannot be machined; morphological opening
+suppresses them automatically.
 
-- Any groove, channel, concavity, or recessed surface feature **narrower than
-  6 mm** cannot be physically machined — the tool cannot fit inside.
-- The machining filter suppresses these features automatically using
-  **morphological opening** on the inverted heightfield with a disk footprint
-  equal to the tool radius in pixels.
-- Fabrication reports flag sub-6 mm feature violations in physical millimeters.
-
-### Default parameters (6 mm ball-end mill)
+### Default parameters
 
 | Parameter | Default | Notes |
 |---|---|---|
 | `tool_radius_mm` | 3.0 | Radius = diameter / 2 |
 | `physical_size_mm` | 50.0 | Part XY footprint in mm |
 | `max_height_mm` | 5.0 | Maximum relief depth in mm |
-| `max_slope_deg` | 45.0 | 3-axis machining limit |
+| `max_slope_deg` | 45.0 | Plateau-only slope target |
+| `terrace_steps` | 0 (auto) | Auto derives from size / tool diameter |
 | `face_limit` | 500 000 | Fusion 360 CAM stability limit |
-| `gaussian_sigma_px` | auto | tool_radius_mm / pixel_size_mm |
 
 ### Running the app
 
@@ -54,30 +65,16 @@ The default milling tool is a **6 mm diameter ball-end mill** (radius = 3 mm).
 python src/app.py
 ```
 
-- **Tab 3 — Diffusion:** Check **Apply machining filter** to run the filter
-  immediately after generation. Side-by-side previews show raw vs filtered.
-- **Tab 6 — Fabrication Check:** Use the **Heightfield source** dropdown
-  (`auto` / `raw` / `machinable`) to compare before and after filtering.
-  The machining filter report is shown as JSON.
-
-### Running the CLI pipeline
-
-```bash
-python src/agent.py path/to/image.jpg
-# Machining filter is ON by default (apply_machining_filter=True).
-# Outputs:
-#   outputs/heightfields/heightfield_raw.npy
-#   outputs/heightfields/heightfield_machinable.npy
-#   outputs/heightfields/machining_filter_report.json
-#   outputs/stl_fabrication/tactile.stl
-```
+- **Tab 3 — Diffusion:** Generates raw heightfield via the trained DDPM.
+- **Tab 3.5 — Machining Filter:** ADC quantisation. Shows plateau fraction,
+  plateau slope, raw slope (with risers), and full JSON report.
+- **Tab 4 — Geometry:** Heightfield → watertight STL.
+- **Tab 5 — Mockup:** 256×256 OBJ preview with z-exaggeration.
+- **Tab 6 — Fabrication Check:** Mesh slope / watertightness / face count /
+  GRBL workspace check. Slope check masks near-vertical risers automatically.
 
 ### Running tests
 
 ```bash
 pytest tests/test_machining_filter.py -v
 ```
-
-Tests cover: slope reduction, face-budget logic, shape validity, geometry
-compatibility, report field population, JSON serialization, and narrow-recess
-suppression (the 6 mm constraint).

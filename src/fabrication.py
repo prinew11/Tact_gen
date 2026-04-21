@@ -12,11 +12,11 @@ import numpy as np
 @dataclass
 class FabricationConfig:
     max_slope_deg: float = 45.0       # 3-axis machining limit
-    tool_radius_mm: float = 0.5       # ball end mill radius
+    tool_radius_mm: float = 3.0       # 6 mm ball end mill
     max_face_count: int = 500_000     # Fusion CAM stability limit
     min_feedrate_mm_min: float = 45.0 # GRBL hard lower limit
-    physical_size_mm: float = 50.0    # XY extent for GRBL workspace check
-    max_height_mm: float = 5.0        # Z range
+    physical_size_mm: float = 100.0   # XY extent for GRBL workspace check
+    max_height_mm: float = 10.0       # Z range
     base_thickness_mm: float = 2.0    # flat bottom
 
 
@@ -25,7 +25,7 @@ class FabricationReport:
     watertight: bool
     face_count: int
     max_slope_deg: float
-    min_feature_mm: float
+    grid_spacing_mm: float
     passes: bool
     grbl_compatible: bool = True
     issues: list[str] = field(default_factory=list)
@@ -73,14 +73,11 @@ def check_mesh(
             f"Max top-surface slope {max_slope:.1f}° exceeds limit {config.max_slope_deg}°"
         )
 
-    # Minimum feature size: grid spacing (XY step between vertices)
-    # This is the physical distance per mesh cell — determines the smallest
-    # detail the mesh can represent.  The morphological opening in the
-    # corrector already ensures heightfield features are ≥ tool diameter;
-    # here we just report the grid resolution so the user can judge.
+    # Grid spacing (physical distance per mesh cell). Minimum feature sizing
+    # is enforced upstream in machining_filter via morphological opening;
+    # this is just reported for context.
     edge_lengths = mesh.edges_unique_length
     grid_spacing = float(np.median(edge_lengths)) if len(edge_lengths) > 0 else 0.0
-    min_feature = grid_spacing
 
     # GRBL workspace checks
     grbl_ok = True
@@ -106,7 +103,7 @@ def check_mesh(
         watertight=watertight,
         face_count=face_count,
         max_slope_deg=max_slope,
-        min_feature_mm=min_feature,
+        grid_spacing_mm=grid_spacing,
         passes=passes,
         grbl_compatible=grbl_ok,
         issues=issues,
@@ -119,7 +116,7 @@ def print_report(report: FabricationReport) -> None:
     print(f"  Watertight    : {report.watertight}")
     print(f"  Face count    : {report.face_count:,}")
     print(f"  Max slope     : {report.max_slope_deg:.1f}° (top surface only)")
-    print(f"  Grid spacing  : {report.min_feature_mm:.3f} mm")
+    print(f"  Grid spacing  : {report.grid_spacing_mm:.3f} mm")
     print(f"  GRBL compat   : {report.grbl_compatible}")
     if report.issues:
         print("  Issues:")

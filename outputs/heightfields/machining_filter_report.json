@@ -7,21 +7,19 @@
     353,
     353
   ],
-  "pixel_size_mm": 1.4204545454545454,
+  "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
-  "max_slope_deg_before": 69.19683074951172,
-  "max_slope_deg_after": 29.070249557495117,
+  "terrace_steps_applied": 11,
+  "step_height_mm": 1.0,
+  "plateau_fraction": 0.9472991517466636,
+  "max_plateau_slope_deg": 0.0,
+  "max_raw_slope_deg": 75.74295043945312,
   "min_feature_target_mm": 6.0,
-  "min_feature_estimate_mm": 6.0,
-  "height_scale_applied": 0.658203125,
-  "smoothing_sigma_px": 2.112,
-  "morph_radius_px": 2.112,
-  "terrace_steps_applied": 56,
+  "morph_radius_px": 10.559999999999999,
   "passed": true,
   "issues": [],
   "recommendations": [
-    "Downsampled 512\u2192353 px to satisfy face budget",
-    "Sub-6 mm recesses suppressed via morphological opening (tool diameter 6.0 mm)",
-    "Height compressed to 0.66\u00d7 (13.16 mm effective). Scale is embedded in the saved heightfield \u2014 use max_height_mm as-is."
+    "Downsampled 512\u2192353 px for face budget",
+    "11 terrace levels, step height 1.00 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 94.7%."
   ]
 }

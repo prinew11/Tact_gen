@@ -7,19 +7,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import trimesh
-from trimesh.creation import triangulate_polygon
 
 import numpy as np
 
 
 @dataclass
 class GeometryConfig:
-    resolution: int = 512          # heightfield grid size
-    mesh_resolution: int = 350     # downsample to this for STL (keeps face count < 500K)
-    physical_size_mm: float = 50.0 # physical XY extent in mm
-    max_height_mm: float = 5.0     # Z range in mm
+    physical_size_mm: float = 100.0 # physical XY extent in mm (10 cm)
+    max_height_mm: float = 10.0     # Z range in mm (1 cm)
     base_thickness_mm: float = 2.0 # flat bottom thickness in mm
-    face_limit: int = 500_000      # decimate to this after building grid mesh
+    face_limit: int = 500_000      # Fusion CAM stability limit
+
+
+def _target_resolution_for_face_budget(face_limit: int, current_res: int) -> int:
+    """Largest R s.t. 4*(R-1)*(R+1) <= face_limit."""
+    import math
+    n = current_res - 1
+    if 4 * n * (n + 2) <= face_limit:
+        return current_res
+    r_max = int(math.floor(math.sqrt(face_limit / 4.0 + 1.0)))
+    return max(r_max, 2)
 
 
 def heightfield_to_mesh(
@@ -43,76 +50,77 @@ def heightfield_to_mesh(
     if config is None:
         config = GeometryConfig()
 
-    # Only resize if the heightfield exceeds the face budget.
-    # machining_filter already downsamples to ~354 px using INTER_AREA and then
-    # applies terracing at that resolution.  Re-resizing with any interpolation
-    # (NEAREST creates 1-px jumps; AREA blurs steps) would corrupt the result.
-    # Raw inputs (512 px, ~1M faces) still need downsizing.
-    mr = config.mesh_resolution
-    n = min(heightfield.shape) - 1
-    face_estimate = 4 * n * (n + 2)   # top + bottom + 4 side walls
-    if face_estimate > config.face_limit:
-        heightfield = cv2.resize(heightfield, (mr, mr), interpolation=cv2.INTER_AREA)
+    target_res = _target_resolution_for_face_budget(
+        config.face_limit, min(heightfield.shape)
+    )
+    if target_res < min(heightfield.shape):
+        heightfield = cv2.resize(
+            heightfield, (target_res, target_res), interpolation=cv2.INTER_AREA
+        )
 
     h, w = heightfield.shape
-    dx = config.physical_size_mm / (w - 1)
-    dy = config.physical_size_mm / (h - 1)
+    n = w * h
 
-    # Build vertex grid
+    # Vertex grid (fully vectorised)
     xs = np.linspace(0, config.physical_size_mm, w)
     ys = np.linspace(0, config.physical_size_mm, h)
     xv, yv = np.meshgrid(xs, ys)
-
     z_top = heightfield * config.max_height_mm + config.base_thickness_mm
-    z_bot = np.zeros_like(z_top)
-
-    # Top surface vertices
     verts_top = np.stack([xv.ravel(), yv.ravel(), z_top.ravel()], axis=1)
-    # Bottom surface vertices (flat)
-    verts_bot = np.stack([xv.ravel(), yv.ravel(), z_bot.ravel()], axis=1)
+    verts_bot = np.stack([xv.ravel(), yv.ravel(), np.zeros_like(z_top).ravel()], axis=1)
+    vertices = np.vstack([verts_top, verts_bot]).astype(np.float64)
 
-    n = w * h
-    vertices = np.vstack([verts_top, verts_bot])  # (2n, 3)
+    # --- Vectorised face construction ---
+    rr, cc = np.mgrid[:h - 1, :w - 1]
+    i00 = (rr * w + cc).ravel()
+    i01 = i00 + 1
+    i10 = i00 + w
+    i11 = i10 + 1
 
-    def grid_idx(row: int, col: int) -> int:
-        return row * w + col
-
-    faces = []
-
-    # Top and bottom quad → 2 triangles each
-    for r in range(h - 1):
-        for c in range(w - 1):
-            i00 = grid_idx(r, c)
-            i10 = grid_idx(r + 1, c)
-            i01 = grid_idx(r, c + 1)
-            i11 = grid_idx(r + 1, c + 1)
-            # Top (CCW when viewed from +Z)
-            faces += [[i00, i01, i11], [i00, i11, i10]]
-            # Bottom (CW when viewed from +Z → outward normal is -Z)
-            faces += [[n + i00, n + i11, n + i01], [n + i00, n + i10, n + i11]]
+    top_faces = np.concatenate([
+        np.stack([i00, i01, i11], axis=1),
+        np.stack([i00, i11, i10], axis=1),
+    ])
+    # Bottom (reverse winding so normal points -Z)
+    bot_faces = np.concatenate([
+        np.stack([n + i00, n + i11, n + i01], axis=1),
+        np.stack([n + i00, n + i10, n + i11], axis=1),
+    ])
 
     # Side walls
-    for c in range(w - 1):
-        # Front (row=0)
-        i0, i1 = grid_idx(0, c), grid_idx(0, c + 1)
-        faces += [[i0, n + i0, n + i1], [i0, n + i1, i1]]
-        # Back (row=h-1)
-        i0, i1 = grid_idx(h - 1, c), grid_idx(h - 1, c + 1)
-        faces += [[i0, i1, n + i1], [i0, n + i1, n + i0]]
+    c_idx = np.arange(w - 1)
+    r_idx = np.arange(h - 1)
+    # Front (row=0)
+    f0, f1 = c_idx, c_idx + 1
+    front = np.concatenate([
+        np.stack([f0, n + f0, n + f1], axis=1),
+        np.stack([f0, n + f1, f1], axis=1),
+    ])
+    # Back (row=h-1)
+    b0 = (h - 1) * w + c_idx
+    b1 = b0 + 1
+    back = np.concatenate([
+        np.stack([b0, b1, n + b1], axis=1),
+        np.stack([b0, n + b1, n + b0], axis=1),
+    ])
+    # Left (col=0)
+    l0 = r_idx * w
+    l1 = l0 + w
+    left = np.concatenate([
+        np.stack([l0, l1, n + l1], axis=1),
+        np.stack([l0, n + l1, n + l0], axis=1),
+    ])
+    # Right (col=w-1)
+    ri0 = r_idx * w + (w - 1)
+    ri1 = ri0 + w
+    right = np.concatenate([
+        np.stack([ri0, n + ri0, n + ri1], axis=1),
+        np.stack([ri0, n + ri1, ri1], axis=1),
+    ])
 
-    for r in range(h - 1):
-        # Left (col=0)
-        i0, i1 = grid_idx(r, 0), grid_idx(r + 1, 0)
-        faces += [[i0, i1, n + i1], [i0, n + i1, n + i0]]
-        # Right (col=w-1)
-        i0, i1 = grid_idx(r, w - 1), grid_idx(r + 1, w - 1)
-        faces += [[i0, n + i0, n + i1], [i0, n + i1, i1]]
+    faces = np.concatenate([top_faces, bot_faces, front, back, left, right]).astype(np.int64)
 
-    mesh = trimesh.Trimesh(
-        vertices=vertices,
-        faces=np.array(faces, dtype=np.int64),
-        process=True,
-    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
 
     # Decimate to merge coplanar faces on flat terrace regions.
     # Requires the optional fast_simplification package; skipped if absent.

@@ -20,7 +20,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 
-_DEFAULT_TRAINED_CKPT = Path(__file__).resolve().parents[1] / "models" / "improved"
+_DEFAULT_TRAINED_CKPT = Path(__file__).resolve().parents[1] / "models" / "final"
 
 
 @dataclass

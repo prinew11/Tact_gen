@@ -10,23 +10,23 @@ import torch
 import torch.nn.functional as F
 
 
-_SOBEL_X = torch.tensor(
-    [[-1.0, 0.0, 1.0],
-     [-2.0, 0.0, 2.0],
-     [-1.0, 0.0, 1.0]]
-) / 4.0
+# _SOBEL_X = torch.tensor(
+#     [[-1.0, 0.0, 1.0],
+#      [-2.0, 0.0, 2.0],
+#      [-1.0, 0.0, 1.0]]
+# ) / 4.0
 
-_SOBEL_Y = torch.tensor(
-    [[-1.0, -2.0, -1.0],
-     [ 0.0,  0.0,  0.0],
-     [ 1.0,  2.0,  1.0]]
-) / 4.0
+# _SOBEL_Y = torch.tensor(
+#     [[-1.0, -2.0, -1.0],
+#      [ 0.0,  0.0,  0.0],
+#      [ 1.0,  2.0,  1.0]]
+# ) / 4.0
 
 
-def _sobel_kernels(device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    kx = _SOBEL_X.to(device=device, dtype=dtype).view(1, 1, 3, 3)
-    ky = _SOBEL_Y.to(device=device, dtype=dtype).view(1, 1, 3, 3)
-    return kx, ky
+# def _sobel_kernels(device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+#     kx = _SOBEL_X.to(device=device, dtype=dtype).view(1, 1, 3, 3)
+#     ky = _SOBEL_Y.to(device=device, dtype=dtype).view(1, 1, 3, 3)
+#     return kx, ky
 
 
 # def slope_loss(x0_pred: torch.Tensor, max_slope_px: float) -> torch.Tensor:
