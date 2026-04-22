@@ -1,0 +1,23 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\Mauven\.conda\envs\tact311\python.exe
+cachedir: .pytest_cache
+rootdir: d:\gitproject\Tact_gen
+plugins: anyio-4.13.0
+collecting ... collected 14 items
+
+tests/test_terrace_geometry.py::test_quantize_discrete_levels[2] PASSED  [  7%]
+tests/test_terrace_geometry.py::test_quantize_discrete_levels[4] PASSED  [ 14%]
+tests/test_terrace_geometry.py::test_quantize_discrete_levels[5] PASSED  [ 21%]
+tests/test_terrace_geometry.py::test_quantize_discrete_levels[8] PASSED  [ 28%]
+tests/test_terrace_geometry.py::test_enforce_min_recess_width_fills_narrow_pit PASSED [ 35%]
+tests/test_terrace_geometry.py::test_enforce_min_recess_width_preserves_wide_recess PASSED [ 42%]
+tests/test_terrace_geometry.py::test_terrace_faces_are_horizontal_or_vertical PASSED [ 50%]
+tests/test_terrace_geometry.py::test_top_faces_at_discrete_z PASSED      [ 57%]
+tests/test_terrace_geometry.py::test_terrace_mesh_is_watertight[3] PASSED [ 64%]
+tests/test_terrace_geometry.py::test_terrace_mesh_is_watertight[5] PASSED [ 71%]
+tests/test_terrace_geometry.py::test_terrace_mesh_is_watertight[7] PASSED [ 78%]
+tests/test_terrace_geometry.py::test_face_count_under_limit PASSED       [ 85%]
+tests/test_terrace_geometry.py::test_preprocess_output_range PASSED      [ 92%]
+tests/test_terrace_geometry.py::test_flat_heightfield_single_level PASSED [100%]
+
+============================= 14 passed in 2.22s ==============================

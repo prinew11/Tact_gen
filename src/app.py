@@ -242,9 +242,51 @@ def _load_best_heightfield(heightfield_file) -> tuple[np.ndarray, str]:
     return _make_test_heightfield(), "synthetic test"
 
 
-def run_geometry(heightfield_file, physical_size: float, max_height: float):
+def run_geometry(heightfield_file, physical_size: float, max_height: float,
+                 terrace_mode: bool = False, terrace_steps: int = 5,
+                 mesh_resolution: int = 256):
     try:
         hf, hf_source = _load_best_heightfield(heightfield_file)
+        t0 = time.time()
+
+        if terrace_mode:
+            from terrace_geometry import (
+                TerraceConfig, preprocess_for_terrace,
+                heightfield_to_terrace_mesh,
+                save_stl as terrace_save_stl,
+            )
+            hf_prep = preprocess_for_terrace(
+                hf,
+                tool_diameter_mm=6.0,
+                physical_size_mm=physical_size,
+                target_resolution=int(mesh_resolution),
+            )
+            cfg = TerraceConfig(
+                physical_size_mm=physical_size,
+                max_height_mm=max_height,
+                terrace_steps=int(terrace_steps),
+                tool_diameter_mm=6.0,
+                mesh_resolution=int(mesh_resolution),
+            )
+            mesh, t_report = heightfield_to_terrace_mesh(hf_prep, cfg)
+            stl_path = OUT / "stl_fabrication" / "tactile_terrace.stl"
+            terrace_save_stl(mesh, stl_path)
+            np.save(str(OUT / "heightfields" / "heightfield_terrace.npy"), hf_prep)
+            elapsed = time.time() - t0
+            info = (
+                f"**Terrace Geometry 构建完成**\n\n"
+                f"- 输入来源: {hf_source}\n"
+                f"- 台阶数: {cfg.terrace_steps}\n"
+                f"- 网格分辨率: {mesh_resolution}×{mesh_resolution}\n"
+                f"- 顶点数: {t_report.vertex_count:,}\n"
+                f"- 面数: {t_report.face_count:,}\n"
+                f"- 水密性: {t_report.watertight}\n"
+                f"- 最小凹槽约束: >{t_report.min_recess_enforced_mm} mm\n"
+                f"- 问题: {t_report.issues or '无'}\n"
+                f"- 构建耗时: {elapsed:.2f}s\n"
+                f"- STL 已保存: `{stl_path.relative_to(ROOT)}`"
+            )
+            return _arr_to_uint8(hf_prep), info
 
         from geometry import GeometryConfig, heightfield_to_mesh, save_stl
 
@@ -252,16 +294,14 @@ def run_geometry(heightfield_file, physical_size: float, max_height: float):
             physical_size_mm=physical_size,
             max_height_mm=max_height,
         )
-        t0 = time.time()
         mesh = heightfield_to_mesh(hf, config)
-        elapsed = time.time() - t0
-
         stl_path = OUT / "stl_fabrication" / "tactile.stl"
         save_stl(mesh, stl_path)
+        elapsed = time.time() - t0
 
         info = (
             f"**Geometry 模块测试通过**\n\n"
-            f"- 输入来��: {hf_source}\n"
+            f"- 输入来源: {hf_source}\n"
             f"- 输入高度场: {hf.shape}\n"
             f"- 顶点数: {len(mesh.vertices):,}\n"
             f"- 面数: {len(mesh.faces):,}\n"
@@ -321,12 +361,18 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
 
 def run_fabrication(heightfield_file, hf_source_choice: str,
                     tool_radius: float, max_slope: float,
-                    physical_size: float, max_height: float):
+                    physical_size: float, max_height: float,
+                    terrace_mode: bool = False, terrace_steps: int = 5,
+                    mesh_resolution: int = 256):
     try:
         import json as _json
 
         # Load heightfield based on source choice
-        if hf_source_choice == "raw":
+        if hf_source_choice == "terrace":
+            terr_path = OUT / "heightfields" / "heightfield_terrace.npy"
+            hf = np.load(str(terr_path)) if terr_path.exists() else _make_test_heightfield()
+            hf_source = "terrace (heightfield_terrace.npy)"
+        elif hf_source_choice == "raw":
             raw_path = OUT / "heightfields" / "heightfield_raw.npy"
             hf = np.load(str(raw_path)) if raw_path.exists() else _make_test_heightfield()
             hf_source = "raw (heightfield_raw.npy)"
@@ -334,7 +380,6 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
             mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
             hf = np.load(str(mac_path)) if mac_path.exists() else _make_test_heightfield()
             hf_source = "machinable (heightfield_machinable.npy)"
-            # Override geometry params with the values stored when the filter ran
             cfg_path = OUT / "heightfields" / "heightfield_machinable_config.json"
             if cfg_path.exists():
                 with open(cfg_path) as _f:
@@ -351,36 +396,67 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
             with open(report_path) as f:
                 filter_report_json = _json.dumps(_json.load(f), indent=2)
 
-        from geometry import GeometryConfig, heightfield_to_mesh
         from fabrication import FabricationConfig, check_mesh
 
-        geo_cfg = GeometryConfig(
-            physical_size_mm=physical_size,
-            max_height_mm=max_height,
-        )
-        mesh = heightfield_to_mesh(hf, geo_cfg)
+        if terrace_mode:
+            from terrace_geometry import (
+                TerraceConfig, preprocess_for_terrace,
+                heightfield_to_terrace_mesh,
+            )
+            hf_prep = preprocess_for_terrace(
+                hf, tool_diameter_mm=6.0,
+                physical_size_mm=physical_size,
+                target_resolution=int(mesh_resolution),
+            )
+            t_cfg = TerraceConfig(
+                physical_size_mm=physical_size,
+                max_height_mm=max_height,
+                terrace_steps=int(terrace_steps),
+                tool_diameter_mm=6.0,
+                mesh_resolution=int(mesh_resolution),
+            )
+            mesh, _ = heightfield_to_terrace_mesh(hf_prep, t_cfg)
+        else:
+            from geometry import GeometryConfig, heightfield_to_mesh
+            geo_cfg = GeometryConfig(
+                physical_size_mm=physical_size,
+                max_height_mm=max_height,
+            )
+            mesh = heightfield_to_mesh(hf, geo_cfg)
+
         config = FabricationConfig(
             tool_radius_mm=tool_radius,
             max_slope_deg=max_slope,
             physical_size_mm=physical_size,
             max_height_mm=max_height,
+            terrace_mode=terrace_mode,
         )
         report = check_mesh(mesh, config)
 
         status = "PASS" if report.passes else "FAIL"
         issues_str = "\n".join(f"  - {i}" for i in report.issues) if report.issues else "  无"
 
+        slope_note = "(台阶模式: 仅参考)" if terrace_mode else f"(限制 {max_slope}°)"
+        extra_rows = ""
+        if terrace_mode and report.terrace_levels_detected:
+            extra_rows = (
+                f"| 台阶层数 | {report.terrace_levels_detected} |\n"
+                f"| 最小凹槽宽 | {report.min_recess_width_mm:.2f} mm |\n"
+            )
+
         info = (
             f"**Fabrication 检查结果: {status}**\n\n"
-            f"- 输入来源: {hf_source}\n\n"
+            f"- 输入来源: {hf_source}\n"
+            f"- 模式: {'台阶 Terrace' if terrace_mode else '标准 Standard'}\n\n"
             f"| 检查项 | 结果 |\n"
             f"|---|---|\n"
             f"| 水密性 | {report.watertight} |\n"
             f"| 面数 | {report.face_count:,} |\n"
-            f"| 最大坡度 (仅顶面) | {report.max_slope_deg:.1f}° (限制 {max_slope}°) |\n"
+            f"| 最大坡度 (仅顶面) | {report.max_slope_deg:.1f}° {slope_note} |\n"
             f"| 最小特征 | {report.min_feature_mm:.3f} mm "
             f"(刀具直径 {tool_radius * 2:.1f} mm) |\n"
-            f"| GRBL 兼容 | {report.grbl_compatible} |\n\n"
+            f"| GRBL 兼容 | {report.grbl_compatible} |\n"
+            f"{extra_rows}\n"
             f"**问题列表:**\n{issues_str}"
         )
         return info, filter_report_json
@@ -562,18 +638,30 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 4: Geometry ----
         with gr.Tab("4. Geometry (STL)"):
-            gr.Markdown("加载 .npy 高度场 → 生成防水 STL\n\n"
-                        "不上传文件则使用 `outputs/heightfields/heightfield.npy` 或自动生成测试数据。")
+            gr.Markdown(
+                "加载 .npy 高度场 → 生成防水 STL\n\n"
+                "勾选 **Terrace Mode** 可生成台阶式几何体（90° 垂直台阶，无坡度优化，"
+                "最小凹槽宽 > 6 mm）。\n"
+                "不上传文件则使用 `outputs/heightfields/` 中最优高度场。"
+            )
             inp_geo_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             with gr.Row():
                 inp_geo_size = gr.Number(label="Physical size (mm)", value=50.0)
                 inp_geo_h = gr.Number(label="Max height (mm)", value=5.0)
+            inp_geo_terrace = gr.Checkbox(
+                label="Terrace Mode (contour-based stepped geometry, 6 mm tool rule)",
+                value=True,
+            )
+            with gr.Row():
+                inp_geo_steps = gr.Slider(2, 12, value=5, step=1, label="台阶数 Terrace Steps")
+                inp_geo_res = gr.Slider(64, 512, value=256, step=32, label="网格分辨率 Mesh Resolution (px)")
             btn_geo = gr.Button("运行 Geometry", variant="primary")
             out_geo_img = gr.Image(label="高度场预览")
             out_geo_info = gr.Markdown()
             btn_geo.click(
                 run_geometry,
-                inputs=[inp_geo_file, inp_geo_size, inp_geo_h],
+                inputs=[inp_geo_file, inp_geo_size, inp_geo_h,
+                        inp_geo_terrace, inp_geo_steps, inp_geo_res],
                 outputs=[out_geo_img, out_geo_info],
             )
 
@@ -596,19 +684,27 @@ def build_app() -> gr.Blocks:
         # ---- Tab 6: Fabrication Check ----
         with gr.Tab("6. Fabrication Check"):
             gr.Markdown(
-                "加载高度场 → 构建 mesh → 检查水密性/面数/坡度(仅顶面)/最小特征/GRBL兼容\n\n"
-                "优先使用 machinable 高度场 (`heightfield_machinable.npy`)。\n"
+                "加载高度场 → 构建 mesh → 检查水密性/面数/最小特征/GRBL兼容\n\n"
+                "**台阶模式 (Terrace Mode)**: 坡度仅作参考，改为检查最小凹槽宽 > 6 mm 和台阶层数。\n"
+                "**标准模式**: 坡度超限则 FAIL。\n"
                 "**刀具直径 6 mm** — 小于 6 mm 的凹槽/沟道将被报告为问题。"
             )
             inp_fab_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             inp_fab_source = gr.Dropdown(
-                choices=["auto", "raw", "machinable"],
+                choices=["auto", "raw", "machinable", "terrace"],
                 value="auto",
-                label="Heightfield source (auto = best available)",
+                label="Heightfield source (terrace = heightfield_terrace.npy)",
+            )
+            inp_fab_terrace = gr.Checkbox(
+                label="Terrace Mode (use terrace_geometry, skip slope pass/fail)",
+                value=True,
             )
             with gr.Row():
+                inp_fab_steps = gr.Slider(2, 12, value=5, step=1, label="台阶数 Terrace Steps")
+                inp_fab_res = gr.Slider(64, 512, value=256, step=32, label="网格分辨率 Mesh Resolution (px)")
+            with gr.Row():
                 inp_fab_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-                inp_fab_slope = gr.Number(label="Max slope (°)", value=45.0)
+                inp_fab_slope = gr.Number(label="Max slope (°, standard mode only)", value=45.0)
             with gr.Row():
                 inp_fab_size = gr.Number(label="Physical size (mm)", value=50.0)
                 inp_fab_h = gr.Number(label="Max height (mm)", value=5.0)
@@ -620,7 +716,8 @@ def build_app() -> gr.Blocks:
             btn_fab.click(
                 run_fabrication,
                 inputs=[inp_fab_file, inp_fab_source, inp_fab_tr, inp_fab_slope,
-                        inp_fab_size, inp_fab_h],
+                        inp_fab_size, inp_fab_h,
+                        inp_fab_terrace, inp_fab_steps, inp_fab_res],
                 outputs=[out_fab_info, out_fab_filter_json],
             )
 

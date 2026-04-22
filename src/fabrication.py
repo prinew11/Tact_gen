@@ -1,6 +1,11 @@
 """
 Fabrication checks: slope, minimum feature size, watertightness, face count.
 Validates mesh is compatible with Fusion 360 CAM + GRBL machining.
+
+Two modes:
+  Standard mode  — checks slope as a pass/fail criterion (original behaviour).
+  Terrace mode   — slope check is informational only; instead checks minimum
+                   recess width > tool_diameter_mm and counts terrace levels.
 """
 from __future__ import annotations
 
@@ -12,12 +17,13 @@ import numpy as np
 @dataclass
 class FabricationConfig:
     max_slope_deg: float = 45.0       # 3-axis machining limit
-    tool_radius_mm: float = 0.5       # ball end mill radius
+    tool_radius_mm: float = 3.0       # 6 mm ball end mill radius = 3 mm
     max_face_count: int = 500_000     # Fusion CAM stability limit
     min_feedrate_mm_min: float = 45.0 # GRBL hard lower limit
     physical_size_mm: float = 50.0    # XY extent for GRBL workspace check
     max_height_mm: float = 5.0        # Z range
     base_thickness_mm: float = 2.0    # flat bottom
+    terrace_mode: bool = False        # when True: skip slope pass/fail
 
 
 @dataclass
@@ -29,6 +35,9 @@ class FabricationReport:
     passes: bool
     grbl_compatible: bool = True
     issues: list[str] = field(default_factory=list)
+    # Terrace-mode extras (populated when FabricationConfig.terrace_mode is True)
+    terrace_levels_detected: int = 0
+    min_recess_width_mm: float = 0.0
 
 
 def check_mesh(
@@ -68,16 +77,17 @@ def check_mesh(
     else:
         max_slope = 0.0
 
-    if max_slope > config.max_slope_deg:
+    if not config.terrace_mode and max_slope > config.max_slope_deg:
+        # Slope is a hard pass/fail only in standard (non-terrace) mode.
+        # In terrace mode the risers are intentionally 90-degree walls, so
+        # slope is measured and reported but does NOT cause a check failure.
         issues.append(
             f"Max top-surface slope {max_slope:.1f}° exceeds limit {config.max_slope_deg}°"
         )
 
-    # Minimum feature size: grid spacing (XY step between vertices)
-    # This is the physical distance per mesh cell — determines the smallest
-    # detail the mesh can represent.  The morphological opening in the
-    # corrector already ensures heightfield features are ≥ tool diameter;
-    # here we just report the grid resolution so the user can judge.
+    # Minimum feature size: median unique edge length approximates the smallest
+    # representable detail.  In terrace mode this also estimates the minimum
+    # recess floor width (the narrowest flat plateau in the mesh).
     edge_lengths = mesh.edges_unique_length
     grid_spacing = float(np.median(edge_lengths)) if len(edge_lengths) > 0 else 0.0
     min_feature = grid_spacing
@@ -100,6 +110,23 @@ def check_mesh(
         )
         grbl_ok = False
 
+    # Terrace-mode extras
+    terrace_levels = 0
+    min_recess_width = 0.0
+    if config.terrace_mode:
+        tool_diameter_mm = config.tool_radius_mm * 2.0
+        min_recess_width = min_feature
+        if min_recess_width <= tool_diameter_mm:
+            issues.append(
+                f"Minimum recess width ~{min_recess_width:.2f} mm is <= tool diameter "
+                f"{tool_diameter_mm:.1f} mm.  Some recesses may be unmachineable."
+            )
+        # Estimate terrace level count from distinct Z values among upward-facing faces.
+        if top_mask.any():
+            top_z = mesh.vertices[mesh.faces[top_mask], 2]
+            unique_z = np.unique(np.round(top_z, decimals=4))
+            terrace_levels = int(len(unique_z))
+
     passes = len(issues) == 0
 
     return FabricationReport(
@@ -110,6 +137,8 @@ def check_mesh(
         passes=passes,
         grbl_compatible=grbl_ok,
         issues=issues,
+        terrace_levels_detected=terrace_levels,
+        min_recess_width_mm=min_recess_width,
     )
 
 
@@ -121,6 +150,9 @@ def print_report(report: FabricationReport) -> None:
     print(f"  Max slope     : {report.max_slope_deg:.1f}° (top surface only)")
     print(f"  Grid spacing  : {report.min_feature_mm:.3f} mm")
     print(f"  GRBL compat   : {report.grbl_compatible}")
+    if report.terrace_levels_detected:
+        print(f"  Terrace levels: {report.terrace_levels_detected}")
+        print(f"  Min recess w  : {report.min_recess_width_mm:.3f} mm")
     if report.issues:
         print("  Issues:")
         for issue in report.issues:

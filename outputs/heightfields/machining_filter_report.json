@@ -7,21 +7,21 @@
     353,
     353
   ],
-  "pixel_size_mm": 1.4204545454545454,
+  "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
-  "max_slope_deg_before": 69.19683074951172,
-  "max_slope_deg_after": 29.070249557495117,
-  "min_feature_target_mm": 6.0,
-  "min_feature_estimate_mm": 6.0,
-  "height_scale_applied": 0.658203125,
-  "smoothing_sigma_px": 2.112,
-  "morph_radius_px": 2.112,
-  "terrace_steps_applied": 56,
+  "max_slope_deg_before": 82.32757568359375,
+  "max_slope_deg_after": 58.19527816772461,
+  "min_feature_target_mm": 1.0,
+  "min_feature_estimate_mm": 1.0,
+  "height_scale_applied": 0.6474609375,
+  "smoothing_sigma_px": 1.7599999999999998,
+  "morph_radius_px": 1.7599999999999998,
+  "terrace_steps_applied": 67,
   "passed": true,
   "issues": [],
   "recommendations": [
     "Downsampled 512\u2192353 px to satisfy face budget",
-    "Sub-6 mm recesses suppressed via morphological opening (tool diameter 6.0 mm)",
-    "Height compressed to 0.66\u00d7 (13.16 mm effective). Scale is embedded in the saved heightfield \u2014 use max_height_mm as-is."
+    "Sub-1 mm recesses suppressed via morphological opening (tool diameter 1.0 mm)",
+    "Height compressed to 0.65\u00d7 (6.47 mm effective). Scale is embedded in the saved heightfield \u2014 use max_height_mm as-is."
   ]
 }
