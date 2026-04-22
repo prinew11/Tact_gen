@@ -265,7 +265,7 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
         zv = small * max_height * 2.0  # z_scale=2.0
 
         fig, ax = plt.subplots(figsize=(5, 5))
-        im = ax.imshow(zv, origin="lower", cmap="terrain")
+        im = ax.imshow(zv, cmap="terrain")
         plt.colorbar(im, ax=ax, label="Height (mm × 2)")
         ax.set_title("Mockup Preview (256×256)")
         fig.tight_layout()

@@ -62,6 +62,9 @@ def heightfield_to_mesh(
     n = w * h
 
     # Vertex grid (fully vectorised)
+    # Flip heightfield vertically so image row 0 (top) maps to world y_max (top).
+    # Keep xs/ys ascending so face winding / normals stay correct.
+    heightfield = np.flipud(heightfield)
     xs = np.linspace(0, config.physical_size_mm, w)
     ys = np.linspace(0, config.physical_size_mm, h)
     xv, yv = np.meshgrid(xs, ys)

@@ -38,8 +38,9 @@ def generate_mockup(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Downsample
+    # Downsample, then flip vertically so image row 0 (top) → world y_max (top).
     small = cv2.resize(heightfield, (_MOCKUP_RES, _MOCKUP_RES), interpolation=cv2.INTER_AREA)
+    small = np.flipud(small)
 
     h, w = small.shape
     xs = np.linspace(0, physical_size_mm, w)
