@@ -1,11 +1,9 @@
 """
-Fabrication checks: slope, minimum feature size, watertightness, face count.
+Fabrication checks: minimum feature size, watertightness, face count.
 Validates mesh is compatible with Fusion 360 CAM + GRBL machining.
 
-Two modes:
-  Standard mode  — checks slope as a pass/fail criterion (original behaviour).
-  Terrace mode   — slope check is informational only; instead checks minimum
-                   recess width > tool_diameter_mm and counts terrace levels.
+Slope is measured and reported but does not affect pass/fail.
+Terrace mode additionally checks minimum recess width and counts terrace levels.
 """
 from __future__ import annotations
 
@@ -16,14 +14,13 @@ import numpy as np
 
 @dataclass
 class FabricationConfig:
-    max_slope_deg: float = 45.0       # 3-axis machining limit
     tool_radius_mm: float = 3.0       # 6 mm ball end mill radius = 3 mm
     max_face_count: int = 500_000     # Fusion CAM stability limit
     min_feedrate_mm_min: float = 45.0 # GRBL hard lower limit
     physical_size_mm: float = 50.0    # XY extent for GRBL workspace check
     max_height_mm: float = 5.0        # Z range
     base_thickness_mm: float = 2.0    # flat bottom
-    terrace_mode: bool = False        # when True: skip slope pass/fail
+    terrace_mode: bool = False
 
 
 @dataclass
@@ -76,14 +73,6 @@ def check_mesh(
         max_slope = float(top_slopes.max())
     else:
         max_slope = 0.0
-
-    if not config.terrace_mode and max_slope > config.max_slope_deg:
-        # Slope is a hard pass/fail only in standard (non-terrace) mode.
-        # In terrace mode the risers are intentionally 90-degree walls, so
-        # slope is measured and reported but does NOT cause a check failure.
-        issues.append(
-            f"Max top-surface slope {max_slope:.1f}° exceeds limit {config.max_slope_deg}°"
-        )
 
     # Minimum feature size: median unique edge length approximates the smallest
     # representable detail.  In terrace mode this also estimates the minimum

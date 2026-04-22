@@ -134,7 +134,7 @@ def run_diffusion(image: np.ndarray | None, steps: int):
 # ===== 3.5 Fabrication Correction ==========================================
 
 def run_fabrication_correction(heightfield_file, physical_size, max_height,
-                               tool_radius, max_slope, material_hint,
+                               tool_radius, material_hint,
                                apply_machining_filter: bool = False):
     try:
         if heightfield_file is not None:
@@ -154,7 +154,6 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
             physical_size_mm=float(physical_size),
             max_height_mm=float(max_height),
             tool_radius_mm=float(tool_radius),
-            max_slope_deg=float(max_slope),
             resolution=hf.shape[0],
         )
         mat = material_hint.strip() if material_hint and material_hint.strip() else None
@@ -169,12 +168,7 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
 
         info = (
             f"**Fabrication Correction 完成** ({elapsed:.2f}s)\n\n"
-            f"| 指标 | 修正前 | 修正后 |\n"
-            f"|---|---|---|\n"
-            f"| 最大坡度 | {report.original_max_slope_deg:.1f}° | {report.corrected_max_slope_deg:.1f}° |\n"
-            f"| 坡度违规像素 | {report.slope_violations_before:,} | {report.slope_violations_after:,} |\n\n"
             f"- 形态学修改像素: {report.morph_pixels_changed:,}\n"
-            f"- 传播扫描次数: {report.propagation_sweeps_used}\n"
             f"- 应用约束: {', '.join(report.constraints_applied)}\n"
             f"- 语义指导: {', '.join(report.guidance_used)}\n"
             f"- 已保存: `{corr_path.relative_to(ROOT)}`"
@@ -195,7 +189,6 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
                 physical_size_mm=float(physical_size),
                 max_height_mm=float(max_height),
                 tool_radius_mm=float(tool_radius),
-                max_slope_deg=float(max_slope),
             )
             hf_machinable, mf_report = filter_heightfield_for_machining(hf_corrected, mf_cfg)
             mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
@@ -214,7 +207,6 @@ def run_fabrication_correction(heightfield_file, physical_size, max_height,
             hf_display = hf_machinable
             info += (
                 f"\n\n**Machining Filter 完成**\n"
-                f"- 坡度: {mf_report.max_slope_deg_before:.1f}° → {mf_report.max_slope_deg_after:.1f}°\n"
                 f"- 台阶数: {mf_report.terrace_steps_applied}\n"
                 f"- Machinable 已保存: `{mac_path.relative_to(ROOT)}`"
             )
@@ -360,7 +352,7 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
 # ===== 6. Fabrication Check =================================================
 
 def run_fabrication(heightfield_file, hf_source_choice: str,
-                    tool_radius: float, max_slope: float,
+                    tool_radius: float,
                     physical_size: float, max_height: float,
                     terrace_mode: bool = False, terrace_steps: int = 5,
                     mesh_resolution: int = 256):
@@ -426,7 +418,6 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
 
         config = FabricationConfig(
             tool_radius_mm=tool_radius,
-            max_slope_deg=max_slope,
             physical_size_mm=physical_size,
             max_height_mm=max_height,
             terrace_mode=terrace_mode,
@@ -436,7 +427,6 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
         status = "PASS" if report.passes else "FAIL"
         issues_str = "\n".join(f"  - {i}" for i in report.issues) if report.issues else "  无"
 
-        slope_note = "(台阶模式: 仅参考)" if terrace_mode else f"(限制 {max_slope}°)"
         extra_rows = ""
         if terrace_mode and report.terrace_levels_detected:
             extra_rows = (
@@ -452,7 +442,7 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
             f"|---|---|\n"
             f"| 水密性 | {report.watertight} |\n"
             f"| 面数 | {report.face_count:,} |\n"
-            f"| 最大坡度 (仅顶面) | {report.max_slope_deg:.1f}° {slope_note} |\n"
+            f"| 最大坡度 (仅参考) | {report.max_slope_deg:.1f}° |\n"
             f"| 最小特征 | {report.min_feature_mm:.3f} mm "
             f"(刀具直径 {tool_radius * 2:.1f} mm) |\n"
             f"| GRBL 兼容 | {report.grbl_compatible} |\n"
@@ -601,7 +591,7 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 3.5: Fabrication Correction ----
         with gr.Tab("3.5 Fabrication Correction"):
-            gr.Markdown("对高度场进行加工约束修正：坡度限制、最小特征尺寸、形态学滤波\n\n"
+            gr.Markdown("对高度场进行加工约束修正：最小特征尺寸、形态学滤波\n\n"
                         "基于 Memory Store (RAG) 检索加工知识并自适应修正。\n"
                         "勾选 **Apply machining filter** 可在修正后追加台阶化后处理，"
                         "生成 `heightfield_machinable.npy`。")
@@ -610,7 +600,6 @@ def build_app() -> gr.Blocks:
                 inp_corr_size = gr.Number(label="Physical size (mm)", value=50.0)
                 inp_corr_h = gr.Number(label="Max height (mm)", value=5.0)
                 inp_corr_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-            inp_corr_slope = gr.Slider(20, 60, value=45, step=1, label="最大坡度 (°)")
             inp_corr_mat = gr.Textbox(label="材料提示 (可选)", placeholder="e.g. wood, bark, concrete")
             inp_corr_filter = gr.Checkbox(
                 label="Apply machining filter (terracing + sub-tool-feature suppression)",
@@ -632,7 +621,7 @@ def build_app() -> gr.Blocks:
             btn_corr.click(
                 run_fabrication_correction,
                 inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_slope, inp_corr_mat, inp_corr_filter],
+                        inp_corr_mat, inp_corr_filter],
                 outputs=[out_corr_before, out_corr_after, out_corr_info, out_corr_filter_json],
             )
 
@@ -653,7 +642,7 @@ def build_app() -> gr.Blocks:
                 value=True,
             )
             with gr.Row():
-                inp_geo_steps = gr.Slider(2, 12, value=5, step=1, label="台阶数 Terrace Steps")
+                inp_geo_steps = gr.Slider(2, 64, value=5, step=1, label="台阶数 Terrace Steps")
                 inp_geo_res = gr.Slider(64, 512, value=256, step=32, label="网格分辨率 Mesh Resolution (px)")
             btn_geo = gr.Button("运行 Geometry", variant="primary")
             out_geo_img = gr.Image(label="高度场预览")
@@ -685,9 +674,9 @@ def build_app() -> gr.Blocks:
         with gr.Tab("6. Fabrication Check"):
             gr.Markdown(
                 "加载高度场 → 构建 mesh → 检查水密性/面数/最小特征/GRBL兼容\n\n"
-                "**台阶模式 (Terrace Mode)**: 坡度仅作参考，改为检查最小凹槽宽 > 6 mm 和台阶层数。\n"
-                "**标准模式**: 坡度超限则 FAIL。\n"
-                "**刀具直径 6 mm** — 小于 6 mm 的凹槽/沟道将被报告为问题。"
+                "**台阶模式 (Terrace Mode)**: 检查最小凹槽宽 > 6 mm 和台阶层数。\n"
+                "**刀具直径 6 mm** — 小于 6 mm 的凹槽/沟道将被报告为问题。\n"
+                "坡度仅作参考，不影响通过/失败结果。"
             )
             inp_fab_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             inp_fab_source = gr.Dropdown(
@@ -696,16 +685,14 @@ def build_app() -> gr.Blocks:
                 label="Heightfield source (terrace = heightfield_terrace.npy)",
             )
             inp_fab_terrace = gr.Checkbox(
-                label="Terrace Mode (use terrace_geometry, skip slope pass/fail)",
+                label="Terrace Mode (use terrace_geometry, check min recess width)",
                 value=True,
             )
             with gr.Row():
-                inp_fab_steps = gr.Slider(2, 12, value=5, step=1, label="台阶数 Terrace Steps")
+                inp_fab_steps = gr.Slider(2, 64, value=5, step=1, label="台阶数 Terrace Steps")
                 inp_fab_res = gr.Slider(64, 512, value=256, step=32, label="网格分辨率 Mesh Resolution (px)")
             with gr.Row():
                 inp_fab_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-                inp_fab_slope = gr.Number(label="Max slope (°, standard mode only)", value=45.0)
-            with gr.Row():
                 inp_fab_size = gr.Number(label="Physical size (mm)", value=50.0)
                 inp_fab_h = gr.Number(label="Max height (mm)", value=5.0)
             btn_fab = gr.Button("运行 Fabrication Check", variant="primary")
@@ -715,7 +702,7 @@ def build_app() -> gr.Blocks:
             )
             btn_fab.click(
                 run_fabrication,
-                inputs=[inp_fab_file, inp_fab_source, inp_fab_tr, inp_fab_slope,
+                inputs=[inp_fab_file, inp_fab_source, inp_fab_tr,
                         inp_fab_size, inp_fab_h,
                         inp_fab_terrace, inp_fab_steps, inp_fab_res],
                 outputs=[out_fab_info, out_fab_filter_json],
