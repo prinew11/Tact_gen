@@ -48,6 +48,22 @@ class MachiningFilterConfig:
     # to preserve nearly all perceptible height detail while keeping plateaus
     # large enough for clean flat-end-mill finishing.
     min_step_height_mm: float = 0.2
+    # Widen sub-tool convex features before morph so they survive tool-diameter
+    # filtering.  Trade-off: small bumps become tool-sized disks (geometry no
+    # longer faithful), but features that would otherwise be physically
+    # un-machinable get preserved in spirit.
+    amplify_features: bool = True
+    # Low-pass scale = tool_radius_px * this.  2.0 = only amplify features
+    # strictly smaller than the tool; higher = more conservative.
+    amplify_sigma_factor: float = 2.0
+    # Morphological closing that removes sub-tool grooves.  When off, sub-tool
+    # valleys remain in the STL — visually richer, but the flat mill physically
+    # cannot reach them so the machined part will differ from the preview.
+    apply_morph_opening: bool = True
+    # Prominence threshold (mm): features whose deviation from local baseline
+    # is below this are flattened back to baseline.  0 = disabled (keep all).
+    # Typical values: 0.3-1.0 mm keeps only the most salient bumps.
+    min_feature_prominence_mm: float = 0.0
 
 
 @dataclass
@@ -63,6 +79,7 @@ class MachiningFilterReport:
     max_raw_slope_deg: float = 0.0      # includes risers (will be ~90°)
     min_feature_target_mm: float = 0.0
     morph_radius_px: float = 0.0
+    features_amplified: bool = False
     passed: bool = False
     issues: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
@@ -101,6 +118,37 @@ def _slope_map_deg(hf: np.ndarray, pixel_size_mm: float, max_height_mm: float) -
     z = hf.astype(np.float32) * max_height_mm
     gy, gx = np.gradient(z, pixel_size_mm)
     return np.degrees(np.arctan(np.sqrt(gx ** 2 + gy ** 2)))
+
+
+def _keep_prominent_features(
+    hf: np.ndarray, tool_radius_px: float, min_prominence_norm: float
+) -> np.ndarray:
+    """Flatten features whose |deviation from local baseline| < threshold."""
+    sigma = max(tool_radius_px * 3.0, 1.0)
+    baseline = cv2.GaussianBlur(hf, (0, 0), sigma)
+    detail = hf - baseline
+    mask = np.abs(detail) >= min_prominence_norm
+    return np.clip(baseline + np.where(mask, detail, 0.0), 0.0, 1.0).astype(np.float32)
+
+
+def _amplify_subscale_peaks(
+    hf: np.ndarray, tool_radius_px: float, sigma_factor: float
+) -> np.ndarray:
+    """Widen convex features smaller than the tool so they survive morph.
+
+    Only peaks are widened; sub-tool valleys are unreachable regardless and
+    handled by the morph-opening step.
+    """
+    sigma = max(tool_radius_px * sigma_factor, 1.0)
+    low = cv2.GaussianBlur(hf, (0, 0), sigma)
+    detail_pos = np.maximum(hf - low, 0.0).astype(np.float32)
+
+    r = max(int(math.ceil(tool_radius_px)), 1)
+    yi, xi = np.ogrid[-r: r + 1, -r: r + 1]
+    disk = (xi ** 2 + yi ** 2 <= r ** 2)
+    peaks_widened = grey_dilation(detail_pos, footprint=disk)
+
+    return np.clip(np.maximum(hf, low + peaks_widened), 0.0, 1.0).astype(np.float32)
 
 
 def _suppress_narrow_recesses(hf: np.ndarray, tool_radius_px: float) -> np.ndarray:
@@ -165,7 +213,29 @@ def filter_heightfield_for_machining(
     # genuine features above the tool scale for no machinability gain.
     tool_radius_px = config.tool_radius_mm / pixel_size_mm
     report.morph_radius_px = tool_radius_px
-    hf = _suppress_narrow_recesses(hf, tool_radius_px)
+
+    # --- 2.4. Drop low-prominence features (keep only salient ones) ---
+    if config.min_feature_prominence_mm > 0.0:
+        prom_norm = config.min_feature_prominence_mm / max(config.max_height_mm, 1e-6)
+        hf = _keep_prominent_features(hf, tool_radius_px, prom_norm)
+        report.recommendations.append(
+            f"Dropped features with prominence < {config.min_feature_prominence_mm:.2f} mm."
+        )
+
+    # --- 2.5. Amplify sub-tool convex features (pre-morph) ---
+    if config.amplify_features:
+        hf = _amplify_subscale_peaks(
+            hf, tool_radius_px, config.amplify_sigma_factor
+        )
+        report.features_amplified = True
+
+    if config.apply_morph_opening:
+        hf = _suppress_narrow_recesses(hf, tool_radius_px)
+    else:
+        report.recommendations.append(
+            "Morph opening disabled — STL retains sub-tool grooves that the "
+            "flat mill cannot reach.  Machined part will differ from preview."
+        )
 
     # --- 4. ADC quantisation (hard steps, no softening) ---
     if config.terrace_steps == 0:
@@ -252,6 +322,7 @@ def save_report_json(report: MachiningFilterReport, out_path: str | Path) -> Non
         "max_raw_slope_deg": report.max_raw_slope_deg,
         "min_feature_target_mm": report.min_feature_target_mm,
         "morph_radius_px": report.morph_radius_px,
+        "features_amplified": report.features_amplified,
         "passed": report.passed,
         "issues": report.issues,
         "recommendations": report.recommendations,

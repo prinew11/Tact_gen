@@ -127,7 +127,8 @@ def run_diffusion(image: np.ndarray | None, steps: int):
 # ===== 3.5 Machining Filter (ADC quantisation) =============================
 
 def run_machining_filter(heightfield_file, physical_size, max_height,
-                         tool_radius, max_slope, terrace_steps):
+                         tool_radius, max_slope, terrace_steps,
+                         amplify_features, apply_morph, min_prominence):
     try:
         if heightfield_file is not None:
             hf = np.load(heightfield_file)
@@ -150,6 +151,9 @@ def run_machining_filter(heightfield_file, physical_size, max_height,
             tool_radius_mm=float(tool_radius),
             max_slope_deg=float(max_slope),
             terrace_steps=int(terrace_steps),
+            amplify_features=bool(amplify_features),
+            apply_morph_opening=bool(apply_morph),
+            min_feature_prominence_mm=float(min_prominence),
         )
 
         t0 = time.time()
@@ -502,6 +506,18 @@ def build_app() -> gr.Blocks:
             inp_corr_steps = gr.Number(
                 label="Terrace steps (0 = auto, 1 = disable)", value=0, precision=0,
             )
+            inp_corr_amplify = gr.Checkbox(
+                label="放大小于刀径的凸特征 (widen sub-tool peaks to survive morph)",
+                value=True,
+            )
+            inp_corr_morph = gr.Checkbox(
+                label="启用 morph opening（关闭后 STL 保留视觉细节，但小凹槽实际刀做不出来）",
+                value=True,
+            )
+            inp_corr_prom = gr.Slider(
+                0.0, 3.0, value=0.0, step=0.05,
+                label="最小特征显著度 (mm) — 低于此值的小起伏会被拍平（0 = 保留所有）",
+            )
             btn_corr = gr.Button("运行 Machining Filter", variant="primary")
             with gr.Row():
                 out_corr_before = gr.Image(label="输入高度场")
@@ -513,7 +529,8 @@ def build_app() -> gr.Blocks:
             btn_corr.click(
                 run_machining_filter,
                 inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_slope, inp_corr_steps],
+                        inp_corr_slope, inp_corr_steps, inp_corr_amplify,
+                        inp_corr_morph, inp_corr_prom],
                 outputs=[out_corr_before, out_corr_after, out_corr_info, out_corr_filter_json],
             )
 
