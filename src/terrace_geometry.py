@@ -188,6 +188,9 @@ def heightfield_to_terrace_mesh(
     # Step 3: Resolve checkerboard saddle points that produce non-manifold edges.
     labels = _resolve_checkerboard(labels)
 
+    # Step 4: Flip rows so image-top maps to STL back (y=H_mm), not y=0.
+    labels = np.flipud(labels)
+
     # Precompute z heights for each label value.
     z_table = np.array(
         [_z_of_label(lv, n, config.max_height_mm, config.base_thickness_mm)
