@@ -7,21 +7,21 @@
     353,
     353
   ],
-  "pixel_size_mm": 0.5681818181818182,
+  "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
   "terrace_steps_applied": 100,
   "step_height_mm": 0.20202020202020202,
-  "plateau_fraction": 0.4447592067988669,
+  "plateau_fraction": 0.525363336516624,
   "max_plateau_slope_deg": 0.0,
-  "max_raw_slope_deg": 80.19773864746094,
-  "min_feature_target_mm": 6.0,
-  "morph_radius_px": 5.279999999999999,
+  "max_raw_slope_deg": 83.03484344482422,
+  "min_feature_target_mm": 4.0,
+  "morph_radius_px": 7.039999999999999,
   "features_amplified": false,
   "passed": true,
   "issues": [],
   "recommendations": [
     "Downsampled 512\u2192353 px for face budget",
-    "Dropped features with prominence < 1.10 mm.",
-    "100 terrace levels, step height 0.20 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 44.5%."
+    "Dropped features with prominence < 0.50 mm.",
+    "100 terrace levels, step height 0.20 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 52.5%."
   ]
 }
