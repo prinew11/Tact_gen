@@ -41,7 +41,7 @@ def run_preprocessing(image: np.ndarray | None):
         raise gr.Error("请先上传一张图片")
     try:
         import cv2
-        from preprocessing import load_image_gray, extract_edges, extract_frequency
+        from image_features import extract_edges, extract_frequency
 
         # Gradio gives RGB uint8 (H, W, 3)
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
@@ -68,8 +68,7 @@ def run_tactile_mapping(image: np.ndarray | None):
         raise gr.Error("请先上传一张图片")
     try:
         import cv2
-        from preprocessing import extract_edges, extract_frequency
-        from tactile_mapping import map_features, TactileDescriptor
+        from image_features import extract_edges, extract_frequency, map_features
 
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
         gray = cv2.resize(gray, (512, 512), interpolation=cv2.INTER_AREA)

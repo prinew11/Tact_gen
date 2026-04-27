@@ -1,5 +1,5 @@
 """
-Tests for src/machining_filter.py
+Tests for machining filter functions (now in src/terrace_geometry.py).
 
 Run:  pytest tests/test_machining_filter.py -v
 """
@@ -10,7 +10,7 @@ import json
 import numpy as np
 import pytest
 
-from machining_filter import (
+from terrace_geometry import (
     MachiningFilterConfig,
     MachiningFilterReport,
     compute_pixel_size_mm,

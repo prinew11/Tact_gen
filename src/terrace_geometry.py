@@ -1,24 +1,20 @@
 """
-Contour-based terrace geometry: heightfield -> watertight terrace STL.
+Terrace pipeline: heightfield preprocessing and watertight terrace STL generation.
 
-Geometry model:
-  - Heightfield is quantized to N discrete levels.
-  - Every pixel is a flat platform at its level's z height.
-  - Transitions between adjacent levels are 90-degree vertical risers.
-  - Bottom is a fan-triangulated flat face at z = 0.
-  - Outer perimeter is a set of vertical walls from z = 0 to the pixel height.
+Preprocessing (formerly machining_filter.py):
+  Normalize, downsample, prune high-frequency noise, suppress narrow recesses,
+  smooth, terrace-quantize, and optionally compress height for slope limits.
+  All operations are deterministic.  Hard constraint: any groove narrower than
+  tool_diameter_mm (default 6 mm) cannot be machined and is suppressed.
 
-Hard manufacturability rule (enforced before geometry build):
-  Any recessed feature whose XY width is <= tool_diameter_mm cannot be machined
-  with a 6 mm ball-end mill and is filled / raised using binary morphological
-  CLOSING on the per-level occupancy mask.  Default tool_diameter_mm = 6.0.
-
-No slope optimisation is performed here.  The caller is responsible for any
-diffusion / fabrication-correction pre-processing before calling
-heightfield_to_terrace_mesh().
+Geometry (contour-based terrace mesh):
+  Quantizes the preprocessed heightfield into N discrete levels and builds a
+  watertight stepped mesh with flat horizontal top faces, 90-degree vertical
+  risers, flat bottom, and vertical outer-perimeter walls.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,10 +22,421 @@ from pathlib import Path
 import cv2
 import numpy as np
 import trimesh
+from scipy.ndimage import gaussian_filter, grey_dilation, grey_erosion
 
 
 # ---------------------------------------------------------------------------
-# Config / report dataclasses
+# Preprocessing dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MachiningFilterConfig:
+    physical_size_mm: float = 50.0
+    max_height_mm: float = 5.0
+    tool_radius_mm: float = 3.0        # 6 mm diameter ball-end mill → radius = 3 mm
+    max_slope_deg: float = 45.0
+    face_limit: int = 500_000
+    target_min_feature_factor: float = 1.5
+    gaussian_sigma_px: float = 0.0     # 0 = auto from tool scale
+    max_iterations: int = 10
+    target_resolution_mode: str = "auto"   # "auto" | "fixed"
+    # 0 = auto-compute from physical_size / tool_diameter;
+    # 1 = no terracing; ≥2 = explicit step count.
+    terrace_steps: int = 0
+    # When True: skip Gaussian smoothing, skip height compression.
+    # Only normalize + downsample + mild noise prune + morphological opening.
+    terrace_mode: bool = False
+
+
+@dataclass
+class MachiningFilterReport:
+    input_shape: tuple[int, int] = (0, 0)
+    output_shape: tuple[int, int] = (0, 0)
+    pixel_size_mm: float = 0.0
+    estimated_face_count: int = 0
+    max_slope_deg_before: float = 0.0
+    max_slope_deg_after: float = 0.0
+    min_feature_target_mm: float = 0.0
+    min_feature_estimate_mm: float = 0.0
+    height_scale_applied: float = 1.0
+    smoothing_sigma_px: float = 0.0
+    morph_radius_px: float = 0.0
+    terrace_steps_applied: int = 0
+    passed: bool = False
+    issues: list[str] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing helper functions
+# ---------------------------------------------------------------------------
+
+def normalize_heightfield(hf: np.ndarray) -> np.ndarray:
+    """Clip to [0, 1] and linearly rescale to use full dynamic range."""
+    hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+    lo, hi = float(hf.min()), float(hf.max())
+    if hi - lo < 1e-7:
+        return hf
+    return ((hf - lo) / (hi - lo)).astype(np.float32)
+
+
+def compute_pixel_size_mm(physical_size_mm: float, resolution: int) -> float:
+    """Physical distance per pixel (edge-to-edge: N-1 intervals)."""
+    return physical_size_mm / max(resolution - 1, 1)
+
+
+def estimate_face_count(resolution: int) -> int:
+    """
+    Estimate triangle count for a watertight heightfield mesh including side walls.
+    Formula: 4*(N-1)*(N+1) = top quads + bottom quads + 4 side wall strips.
+    At N=353 → 498,816 faces, safely under the 500k Fusion limit.
+    """
+    n = resolution - 1
+    return 4 * n * (n + 2)
+
+
+def estimate_target_resolution_for_face_budget(
+    face_limit: int,
+    current_res: int,
+) -> int:
+    """
+    Return the largest resolution R such that estimate_face_count(R) <= face_limit.
+    Returns current_res unchanged if already within budget.
+    """
+    if estimate_face_count(current_res) <= face_limit:
+        return current_res
+    r_max = int(math.floor(math.sqrt(face_limit / 4.0 + 1.0)))
+    return max(r_max, 2)
+
+
+def estimate_slope_map_deg(
+    heightfield: np.ndarray,
+    pixel_size_mm: float,
+    max_height_mm: float,
+) -> np.ndarray:
+    """Compute per-pixel slope in degrees."""
+    z = heightfield.astype(np.float32) * max_height_mm
+    gy, gx = np.gradient(z, pixel_size_mm)
+    slope_rad = np.arctan(np.sqrt(gx ** 2 + gy ** 2))
+    return np.degrees(slope_rad)
+
+
+def smooth_by_tool_scale(
+    heightfield: np.ndarray,
+    tool_radius_mm: float,
+    pixel_size_mm: float,
+    sigma_override_px: float = 0.0,
+    terrace_steps: int = 1,
+    riser_sigma_px: float = 0.0,
+) -> np.ndarray:
+    """
+    Gaussian blur at sigma = tool_radius_mm / pixel_size_mm, then optionally
+    quantize into discrete height levels to produce a terraced topology.
+
+    Args:
+        terrace_steps: number of discrete height levels.  1 = no terracing.
+        riser_sigma_px: Gaussian sigma for step-edge softening.  0 = auto.
+    """
+    sigma = sigma_override_px if sigma_override_px > 0.0 else max(
+        tool_radius_mm / pixel_size_mm, 1.0
+    )
+    hf = gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
+
+    if terrace_steps > 1:
+        n = terrace_steps - 1
+        hf = np.round(hf * n) / n
+        r_sigma = riser_sigma_px if riser_sigma_px > 0.0 else max(sigma * 0.5, 1.0)
+        hf = gaussian_filter(hf, sigma=r_sigma)
+        hf = np.clip(hf, 0.0, 1.0)
+
+    return hf
+
+
+def apply_terracing(
+    heightfield: np.ndarray,
+    terrace_steps: int,
+    riser_sigma_px: float = 1.0,
+) -> np.ndarray:
+    """
+    Quantize a smooth heightfield into discrete terrace levels and soften
+    the step risers.  Runs after morphological opening so the opening result
+    blends smoothly before discrete levels are applied.
+    """
+    if terrace_steps <= 1:
+        return heightfield.copy()
+    n = terrace_steps - 1
+    hf = np.round(heightfield.astype(np.float32) * n) / n
+    hf = gaussian_filter(hf, sigma=max(riser_sigma_px, 1.0))
+    return np.clip(hf, 0.0, 1.0)
+
+
+def suppress_narrow_recesses(
+    heightfield: np.ndarray,
+    tool_radius_px: float,
+) -> np.ndarray:
+    """
+    Morphological opening on the inverted heightfield removes grooves and
+    concavities narrower than tool_radius_px * 2 pixels (= tool diameter).
+    Uses grey (grayscale) morphology because heightfields are continuous-valued.
+    """
+    r = max(int(math.ceil(tool_radius_px)), 1)
+    yi, xi = np.ogrid[-r : r + 1, -r : r + 1]
+    disk = (xi ** 2 + yi ** 2 <= r ** 2)
+
+    inv = (1.0 - heightfield).astype(np.float32)
+    inv_eroded = grey_erosion(inv, footprint=disk)
+    inv_opened = grey_dilation(inv_eroded, footprint=disk)
+
+    return np.clip(1.0 - inv_opened, 0.0, 1.0).astype(np.float32)
+
+
+def prune_high_frequency_content(
+    heightfield: np.ndarray,
+    tool_radius_mm: float,
+    pixel_size_mm: float,
+) -> np.ndarray:
+    """
+    Remove spatial noise finer than half the tool radius before terracing.
+    Avoids ragged step edges caused by sub-tool-scale texture in the diffusion
+    output.  Uses a mild Gaussian (sigma = 0.5 * tool_radius / pixel_size).
+    """
+    sigma = max(tool_radius_mm * 0.5 / pixel_size_mm, 0.5)
+    return gaussian_filter(heightfield.astype(np.float32), sigma=sigma)
+
+
+def compress_height_for_slope(
+    heightfield: np.ndarray,
+    max_slope_deg: float,
+    pixel_size_mm: float,
+    max_height_mm: float,
+    max_iters: int = 10,
+) -> tuple[np.ndarray, float]:
+    """
+    Binary-search a height scale factor in (0, 1] so the physical slope stays
+    within max_slope_deg.  Returns (heightfield_unchanged, scale_applied).
+    The heightfield values are NOT modified — multiply max_height_mm by
+    scale_applied when passing to geometry.heightfield_to_mesh.
+    Returns scale=1.0 if the input already satisfies the slope limit.
+    """
+    slope_map = estimate_slope_map_deg(heightfield, pixel_size_mm, max_height_mm)
+    if float(slope_map.max()) <= max_slope_deg:
+        return heightfield.copy(), 1.0
+
+    lo, hi = 0.0, 1.0
+    best_scale = lo
+
+    for _ in range(max_iters):
+        mid = (lo + hi) / 2.0
+        effective_height = max_height_mm * mid
+        slope_map = estimate_slope_map_deg(heightfield, pixel_size_mm, effective_height)
+        if float(slope_map.max()) <= max_slope_deg:
+            best_scale = mid
+            lo = mid
+        else:
+            hi = mid
+
+    return heightfield.copy(), best_scale
+
+
+def filter_heightfield_for_machining(
+    heightfield: np.ndarray,
+    config: MachiningFilterConfig | None = None,
+) -> tuple[np.ndarray, MachiningFilterReport]:
+    """
+    Apply all machining constraints to a heightfield in a deterministic sequence:
+      1. Normalize to [0, 1].
+      2. Downsample if needed to satisfy face_limit (auto mode).
+      3. Prune sub-tool-scale high-frequency noise.
+      4. Morphological opening to suppress sub-tool-diameter recesses.
+      5. Slope measurement (before compression).
+      6. Gaussian smoothing and terracing.
+      7. Iterative height compression to satisfy max_slope_deg.
+      8. Final slope measurement and report.
+    """
+    if config is None:
+        config = MachiningFilterConfig()
+
+    report = MachiningFilterReport()
+
+    if heightfield.ndim != 2:
+        raise ValueError(f"Expected 2-D heightfield, got shape {heightfield.shape}")
+    if heightfield.shape[0] != heightfield.shape[1]:
+        report.issues.append(
+            f"Non-square heightfield {heightfield.shape} — forcing square output"
+        )
+
+    report.input_shape = (heightfield.shape[0], heightfield.shape[1])
+    hf = normalize_heightfield(heightfield)
+
+    # Step 2: Resolution targeting
+    current_res = hf.shape[0]
+    if config.target_resolution_mode == "auto":
+        target_res = estimate_target_resolution_for_face_budget(
+            config.face_limit, current_res
+        )
+        if target_res < current_res:
+            hf = cv2.resize(
+                hf, (target_res, target_res), interpolation=cv2.INTER_AREA
+            )
+            report.recommendations.append(
+                f"Downsampled {current_res}→{target_res} px to satisfy face budget"
+            )
+
+    report.output_shape = (hf.shape[0], hf.shape[1])
+    res = hf.shape[0]
+    pixel_size_mm = compute_pixel_size_mm(config.physical_size_mm, res)
+    report.pixel_size_mm = pixel_size_mm
+    report.estimated_face_count = estimate_face_count(res)
+
+    slope_before_map = estimate_slope_map_deg(hf, pixel_size_mm, config.max_height_mm)
+    report.max_slope_deg_before = float(slope_before_map.max())
+
+    # Step 3.5: Resolve terrace step count
+    if config.terrace_steps == 0:
+        tool_diameter_mm = config.tool_radius_mm * 2.0
+        actual_terrace_steps = max(
+            2,
+            round(config.physical_size_mm / (tool_diameter_mm * config.target_min_feature_factor)),
+        )
+    else:
+        actual_terrace_steps = config.terrace_steps
+    report.terrace_steps_applied = actual_terrace_steps
+
+    # Step 3.6: Prune sub-tool-scale noise before morphological opening
+    hf = prune_high_frequency_content(hf, config.tool_radius_mm, pixel_size_mm)
+    hf = np.clip(hf, 0.0, 1.0)
+
+    # Step 4: Suppress sub-tool-diameter recesses
+    tool_radius_px = config.tool_radius_mm / pixel_size_mm
+    report.morph_radius_px = tool_radius_px
+    hf = suppress_narrow_recesses(hf, tool_radius_px)
+    hf = np.clip(hf, 0.0, 1.0)
+    tool_diameter_mm = config.tool_radius_mm * 2.0
+    report.recommendations.append(
+        f"Sub-{tool_diameter_mm:.0f} mm recesses suppressed via morphological "
+        f"opening (tool diameter {tool_diameter_mm:.1f} mm)"
+    )
+
+    if config.terrace_mode:
+        report.smoothing_sigma_px = 0.0
+        report.height_scale_applied = 1.0
+        report.recommendations.append(
+            "Terrace mode: Gaussian smoothing and slope compression skipped. "
+            "Quantisation is handled by heightfield_to_terrace_mesh()."
+        )
+    else:
+        # Step 5: Gaussian smoothing
+        sigma_px = (
+            config.gaussian_sigma_px
+            if config.gaussian_sigma_px > 0.0
+            else max(config.tool_radius_mm / pixel_size_mm, 1.0)
+        )
+        report.smoothing_sigma_px = sigma_px
+        hf = smooth_by_tool_scale(
+            hf, config.tool_radius_mm, pixel_size_mm,
+            sigma_override_px=sigma_px,
+            terrace_steps=1,
+        )
+        hf = np.clip(hf, 0.0, 1.0)
+
+        # Step 5b: Terracing with slope-calibrated riser sigma
+        if actual_terrace_steps > 1 and config.max_height_mm > 0 and config.max_slope_deg > 0:
+            step_height_mm = config.max_height_mm / (actual_terrace_steps - 1)
+            riser_sigma_px = max(
+                step_height_mm / (
+                    math.tan(math.radians(config.max_slope_deg))
+                    * pixel_size_mm
+                    * math.sqrt(2 * math.pi)
+                ),
+                1.0,
+            )
+        else:
+            riser_sigma_px = max(sigma_px * 0.5, 1.0)
+        hf = apply_terracing(hf, actual_terrace_steps, riser_sigma_px)
+        hf = np.clip(hf, 0.0, 1.0)
+
+        # Step 6: Height compression
+        hf, scale = compress_height_for_slope(
+            hf,
+            config.max_slope_deg * 0.97,
+            pixel_size_mm,
+            config.max_height_mm,
+            config.max_iterations,
+        )
+        report.height_scale_applied = scale
+        hf = (hf * scale).astype(np.float32)
+        if scale < 0.95:
+            report.recommendations.append(
+                f"Height compressed to {scale:.2f}× "
+                f"({config.max_height_mm * scale:.2f} mm effective). "
+                "Scale is embedded in the saved heightfield — use max_height_mm as-is."
+            )
+
+    hf = np.clip(hf, 0.0, 1.0)
+
+    slope_after = estimate_slope_map_deg(hf, pixel_size_mm, config.max_height_mm)
+    report.max_slope_deg_after = float(slope_after.max())
+
+    report.min_feature_target_mm = tool_diameter_mm
+    report.min_feature_estimate_mm = pixel_size_mm * tool_radius_px * 2.0
+
+    if not config.terrace_mode and report.max_slope_deg_after > config.max_slope_deg:
+        report.issues.append(
+            f"Slope {report.max_slope_deg_after:.1f}° still exceeds limit "
+            f"{config.max_slope_deg}° after {config.max_iterations} iterations. "
+            "Increase max_iterations or reduce max_height_mm in GeometryConfig."
+        )
+    if report.estimated_face_count > config.face_limit:
+        report.issues.append(
+            f"Estimated face count {report.estimated_face_count:,} "
+            f"exceeds limit {config.face_limit:,}."
+        )
+    if pixel_size_mm > tool_diameter_mm:
+        report.issues.append(
+            f"Pixel size {pixel_size_mm:.2f} mm > tool diameter {tool_diameter_mm:.1f} mm "
+            "— resolution is too coarse to reliably detect sub-feature violations."
+        )
+
+    report.passed = len(report.issues) == 0
+    return hf, report
+
+
+def save_heightfield(heightfield: np.ndarray, out_path: str | Path) -> None:
+    """Save heightfield as .npy."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(out_path), heightfield)
+    print(f"Saved machinable heightfield: {out_path}")
+
+
+def save_report_json(report: MachiningFilterReport, out_path: str | Path) -> None:
+    """Serialize MachiningFilterReport to JSON."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "input_shape": list(report.input_shape),
+        "output_shape": list(report.output_shape),
+        "pixel_size_mm": report.pixel_size_mm,
+        "estimated_face_count": report.estimated_face_count,
+        "max_slope_deg_before": report.max_slope_deg_before,
+        "max_slope_deg_after": report.max_slope_deg_after,
+        "min_feature_target_mm": report.min_feature_target_mm,
+        "min_feature_estimate_mm": report.min_feature_estimate_mm,
+        "height_scale_applied": report.height_scale_applied,
+        "smoothing_sigma_px": report.smoothing_sigma_px,
+        "morph_radius_px": report.morph_radius_px,
+        "terrace_steps_applied": report.terrace_steps_applied,
+        "passed": report.passed,
+        "issues": report.issues,
+        "recommendations": report.recommendations,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved machining filter report: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Terrace geometry dataclasses
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -55,7 +462,7 @@ class TerraceReport:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal mesh-builder helpers
 # ---------------------------------------------------------------------------
 
 def _quantize(heightfield: np.ndarray, n_levels: int) -> np.ndarray:
@@ -74,8 +481,8 @@ def _resolve_checkerboard(labels: np.ndarray) -> np.ndarray:
       a,b / b,a  (a<b) → raise (pr,pc) and (pr+1,pc+1) to b
       a,b / b,a  (a>b) → raise (pr,pc+1) and (pr+1,pc) to a
 
-    Iterates to convergence. Every iteration that sets changed=True also
-    strictly raises at least one label value, so the loop terminates.
+    Iterates to convergence. Every iteration strictly raises at least one label,
+    so the loop always terminates.
     """
     result = labels.copy()
     h, w = result.shape
@@ -108,13 +515,11 @@ def _enforce_min_recess_width(
     """
     Fill recessed regions whose XY width is <= tool_diameter_mm (6 mm default).
 
-    Strategy: for each level L (highest to lowest), the binary mask
-    (labels >= L) represents all pixels at level L or above.  Narrow holes
-    in this mask are depressions too small for the tool to reach.
-    Morphological CLOSING (dilation then erosion) fills those holes, and any
-    pixel that transitions from below-L to at-or-above-L is raised to level L.
-
-    Processing top-down ensures fills accumulate without oscillation.
+    For each level L (highest to lowest), the binary mask (labels >= L)
+    represents all pixels at level L or above.  Morphological CLOSING fills
+    narrow holes in this mask, and any pixel that transitions from below-L
+    to at-or-above-L is raised to level L.  Processing top-down prevents
+    oscillation.
     """
     result = labels.copy()
     r = max(int(math.ceil(tool_radius_px)), 1)
@@ -207,11 +612,6 @@ def heightfield_to_terrace_mesh(
 
     # ---------------------------------------------------------------------------
     # Allocate vertex / face buffers with a safe upper bound.
-    #   top faces:       h * w * 2  triangles, 4 unique verts each → h*w*4
-    #   horizontal risers: (w-1)*h  pairs → up to (w-1)*h * 2 tris, 4 verts each
-    #   vertical risers:   w*(h-1)  pairs → same
-    #   perimeter walls:   2*(h+w)  columns/rows → 2*(h+w) * 2 tris, 4 verts each
-    #   bottom fan:        2*(h+w)  triangles, 1 center + 2*(h+w)+1 perimeter verts
     # ---------------------------------------------------------------------------
     max_verts = (h * w * 4
                  + (w - 1) * h * 4
@@ -249,9 +649,7 @@ def heightfield_to_terrace_mesh(
     # ---------------------------------------------------------------------------
     # 3a  Top faces — one flat quad per pixel (normal = +Z).
     #
-    #   Pixel (pr, pc) occupies [xc(pc), xc(pc+1)] x [yr(pr), yr(pr+1)].
     #   Winding CCW from +Z → normals +Z.
-    #   Verified: triangle (tl, tr, br): cross((tr-tl),(br-tl)) = (0,0,+dx*dy) → +Z.
     # ---------------------------------------------------------------------------
     for pr in range(h):
         for pc in range(w):
@@ -260,15 +658,12 @@ def heightfield_to_terrace_mesh(
             tr = av(xc(pc + 1), yr(pr),     z)
             br = av(xc(pc + 1), yr(pr + 1), z)
             bl = av(xc(pc),     yr(pr + 1), z)
-            aq(tl, tr, br, bl)   # (tl,tr,br), (tl,br,bl) → +Z normal
+            aq(tl, tr, br, bl)
 
     # ---------------------------------------------------------------------------
-    # 3b  Internal vertical risers (horizontal adjacency: (pr, pc) vs (pr, pc+1)).
+    # 3b  Internal vertical risers (horizontal adjacency).
     #
-    #   Wall at x = xc(pc+1), y in [yr(pr), yr(pr+1)], z from z_lo to z_hi.
-    #   If la < lb (left lower): outward normal = -X → aq(v0, v3, v2, v1).
-    #   If la > lb (right lower): outward normal = +X → aq(v0, v1, v2, v3).
-    #   Verified by cross product on first triangle of each winding.
+    #   Wall at x = xc(pc+1).  la<lb → normal=-X; la>lb → normal=+X.
     # ---------------------------------------------------------------------------
     for pr in range(h):
         row_labels = labels[pr]
@@ -291,12 +686,9 @@ def heightfield_to_terrace_mesh(
                 aq(v0, v1, v2, v3)   # normal = +X
 
     # ---------------------------------------------------------------------------
-    # 3c  Internal vertical risers (vertical adjacency: (pr, pc) vs (pr+1, pc)).
+    # 3c  Internal vertical risers (vertical adjacency).
     #
-    #   Wall at y = yr(pr+1), x in [xc(pc), xc(pc+1)], z from z_lo to z_hi.
-    #   If la > lb (top pixel higher): outward normal = +Y → aq(v0, v3, v2, v1).
-    #   If la < lb (bottom pixel higher): outward normal = -Y → aq(v0, v1, v2, v3).
-    #   Verified by cross product on first triangle of each winding.
+    #   Wall at y = yr(pr+1).  la>lb → normal=+Y; la<lb → normal=-Y.
     # ---------------------------------------------------------------------------
     for pr in range(h - 1):
         for pc in range(w):
@@ -318,12 +710,7 @@ def heightfield_to_terrace_mesh(
                 aq(v0, v1, v2, v3)   # normal = -Y
 
     # ---------------------------------------------------------------------------
-    # Pre-create all z=0 perimeter vertices once so that the outer walls (3d)
-    # and the bottom fan (3e) can share the SAME vertex indices — no merging needed.
-    #
-    #   bot[(pr, pc)] holds the vertex index for grid corner (pr, pc) at z=0.
-    #   Front/back rows cover all w+1 columns including the four corners.
-    #   Left/right columns skip the corner rows (already in front/back).
+    # Pre-create all z=0 perimeter vertices shared by outer walls and bottom fan.
     # ---------------------------------------------------------------------------
     W_mm = xc(w)
     H_mm = yr(h)
@@ -332,30 +719,22 @@ def heightfield_to_terrace_mesh(
     for pc in range(w + 1):
         bot[(0, pc)] = av(xc(pc), yr(0), 0.0)   # front row
         bot[(h, pc)] = av(xc(pc), yr(h), 0.0)   # back row
-    for pr in range(1, h):                        # left/right, skip corners
+    for pr in range(1, h):
         bot[(pr, 0)] = av(xc(0), yr(pr), 0.0)
         bot[(pr, w)] = av(xc(w), yr(pr), 0.0)
 
     # ---------------------------------------------------------------------------
-    # 3d  Outer perimeter walls — z = 0 up to pixel height.
+    # 3d  Outer perimeter walls.
     #
-    #   Uses pre-created bot[] indices for the bottom edge so that wall and fan
-    #   share the same vertices (no trimesh merge needed for these edges).
-    #
-    #   Front (y = 0):  normal = -Y → aq(b0, b1, v2, v3)
-    #   Back  (y = H):  normal = +Y → aq(b0, v3, v2, b1)
-    #   Left  (x = 0):  normal = -X → aq(b0, v3, v2, b1)
-    #   Right (x = W):  normal = +X → aq(b0, b1, v2, v3)
+    #   Front (-Y), Back (+Y), Left (-X), Right (+X).
     # ---------------------------------------------------------------------------
     for pc in range(w):
-        # Front row (pr = 0), y = yr(0)
         z = z_table[labels[0, pc]]
         b0, b1 = bot[(0, pc)], bot[(0, pc + 1)]
         v2 = av(xc(pc + 1), yr(0), z)
         v3 = av(xc(pc),     yr(0), z)
         aq(b0, b1, v2, v3)   # -Y
 
-        # Back row (pr = h-1), y = yr(h)
         z = z_table[labels[h - 1, pc]]
         b0, b1 = bot[(h, pc)], bot[(h, pc + 1)]
         v2 = av(xc(pc + 1), yr(h), z)
@@ -363,14 +742,12 @@ def heightfield_to_terrace_mesh(
         aq(b0, v3, v2, b1)   # +Y
 
     for pr in range(h):
-        # Left col (pc = 0), x = xc(0)
         z = z_table[labels[pr, 0]]
         b0, b1 = bot[(pr, 0)], bot[(pr + 1, 0)]
         v2 = av(xc(0), yr(pr + 1), z)
         v3 = av(xc(0), yr(pr),     z)
         aq(b0, v3, v2, b1)   # -X
 
-        # Right col (pc = w-1), x = xc(w)
         z = z_table[labels[pr, w - 1]]
         b0, b1 = bot[(pr, w)], bot[(pr + 1, w)]
         v2 = av(xc(w), yr(pr + 1), z)
@@ -379,31 +756,18 @@ def heightfield_to_terrace_mesh(
 
     # ---------------------------------------------------------------------------
     # 3e  Bottom face — fan from center, perimeter traversed for normal = -Z.
-    #
-    #   Uses the same bot[] vertex indices as the perimeter walls so every
-    #   bottom edge is shared exactly — no floating-point merge needed.
-    #
-    #   Traversal: LEFT edge UP → BACK edge RIGHT → RIGHT edge DOWN → FRONT LEFT.
-    #   fan(p_i, p_j) = at(cx_idx, p_i, p_j) → -Z normal for this winding.
     # ---------------------------------------------------------------------------
     cx_idx = av(W_mm / 2.0, H_mm / 2.0, 0.0)
 
     def fan(p_i: int, p_j: int) -> None:
         at(cx_idx, p_i, p_j)
 
-    # Left edge UP: (pr=0,pc=0) → (pr=1,pc=0) → ... → (pr=h,pc=0)
     for pr in range(h):
         fan(bot[(pr, 0)], bot[(pr + 1, 0)])
-
-    # Back edge RIGHT: (pr=h,pc=0) → (pr=h,pc=1) → ... → (pr=h,pc=w)
     for pc in range(w):
         fan(bot[(h, pc)], bot[(h, pc + 1)])
-
-    # Right edge DOWN: (pr=h,pc=w) → (pr=h-1,pc=w) → ... → (pr=0,pc=w)
     for pr in range(h):
         fan(bot[(h - pr, w)], bot[(h - 1 - pr, w)])
-
-    # Front edge LEFT: (pr=0,pc=w) → (pr=0,pc=w-1) → ... → (pr=0,pc=0)
     for pc in range(w):
         fan(bot[(0, w - pc)], bot[(0, w - 1 - pc)])
 
@@ -413,7 +777,7 @@ def heightfield_to_terrace_mesh(
     mesh = trimesh.Trimesh(
         vertices=vbuf[:nv],
         faces=fbuf[:nf],
-        process=True,          # merges coincident vertices, fixes winding
+        process=True,
     )
 
     report.face_count = len(mesh.faces)
@@ -437,7 +801,7 @@ def heightfield_to_terrace_mesh(
 
 
 # ---------------------------------------------------------------------------
-# Terrace-aware preprocessing (replaces slope-driven machining_filter steps)
+# Terrace-aware preprocessing
 # ---------------------------------------------------------------------------
 
 def preprocess_for_terrace(
@@ -450,24 +814,16 @@ def preprocess_for_terrace(
     Lightweight preprocessing for terrace mode:
       1. Normalize to [0, 1].
       2. Downsample to target_resolution (INTER_AREA).
-      3. Mild high-frequency pruning (Gaussian sigma = 0.5 * tool_radius_px).
-      4. Morphological opening on the heightfield to suppress continuous narrow
-         recesses narrower than tool_diameter_mm (grey morphology, same as the
-         machining_filter's suppress_narrow_recesses step).
+      3. Mild high-frequency pruning (sigma = 0.5 * tool_radius_px).
+      4. Morphological opening to suppress narrow recesses narrower than
+         tool_diameter_mm (grey morphology).
 
-    No slope optimisation, no terracing, no Gaussian riser blurring.
+    No slope optimisation, no terracing, no riser blurring.
     Quantisation is performed inside heightfield_to_terrace_mesh().
     """
-    from scipy.ndimage import gaussian_filter, grey_erosion, grey_dilation
+    hf = normalize_heightfield(heightfield)
 
-    hf = np.clip(heightfield, 0.0, 1.0).astype(np.float32)
-    lo, hi = float(hf.min()), float(hf.max())
-    if hi - lo > 1e-7:
-        hf = (hf - lo) / (hi - lo)
-
-    # Downsample
-    h0, w0 = hf.shape
-    if h0 != target_resolution or w0 != target_resolution:
+    if hf.shape[0] != target_resolution or hf.shape[1] != target_resolution:
         hf = cv2.resize(hf, (target_resolution, target_resolution),
                         interpolation=cv2.INTER_AREA)
 
@@ -475,21 +831,10 @@ def preprocess_for_terrace(
     tool_radius_mm = tool_diameter_mm / 2.0
     tool_radius_px = tool_radius_mm / px_size
 
-    # Mild noise prune (half-tool-radius sigma)
-    sigma_prune = max(tool_radius_px * 0.5, 0.5)
-    hf = gaussian_filter(hf, sigma=sigma_prune)
-    hf = np.clip(hf, 0.0, 1.0)
+    hf = prune_high_frequency_content(hf, tool_radius_mm, px_size)
+    hf = suppress_narrow_recesses(hf, tool_radius_px)
 
-    # Morphological opening — suppress sub-tool-diameter recesses
-    r = max(int(math.ceil(tool_radius_px)), 1)
-    yi, xi = np.ogrid[-r : r + 1, -r : r + 1]
-    disk = (xi ** 2 + yi ** 2 <= r ** 2)
-    inv = (1.0 - hf).astype(np.float32)
-    inv_eroded = grey_erosion(inv, footprint=disk)
-    inv_opened = grey_dilation(inv_eroded, footprint=disk)
-    hf = np.clip(1.0 - inv_opened, 0.0, 1.0).astype(np.float32)
-
-    return hf
+    return np.clip(hf, 0.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
