@@ -23,7 +23,6 @@ from machining_filter import (
     prune_high_frequency_content,
     save_report_json,
     smooth_by_tool_scale,
-    suppress_narrow_recesses,
 )
 
 

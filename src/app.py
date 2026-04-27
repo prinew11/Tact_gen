@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import sys
 import time
-import traceback
 from pathlib import Path
 
 import gradio as gr
@@ -131,103 +130,12 @@ def run_diffusion(image: np.ndarray | None, steps: int):
         raise gr.Error(f"Diffusion 失败: {e}")
 
 
-# ===== 3.5 Fabrication Correction ==========================================
-
-def run_fabrication_correction(heightfield_file, physical_size, max_height,
-                               tool_radius, material_hint,
-                               apply_machining_filter: bool = False):
-    try:
-        if heightfield_file is not None:
-            hf = np.load(heightfield_file)
-        else:
-            default = OUT / "heightfields" / "heightfield.npy"
-            if not default.exists():
-                hf = _make_test_heightfield()
-            else:
-                hf = np.load(str(default))
-
-        from fabrication_corrector import CorrectionConfig, correct_heightfield, print_correction_report
-        from memory_store import MemoryStore
-
-        store = MemoryStore()
-        config = CorrectionConfig(
-            physical_size_mm=float(physical_size),
-            max_height_mm=float(max_height),
-            tool_radius_mm=float(tool_radius),
-            resolution=hf.shape[0],
-        )
-        mat = material_hint.strip() if material_hint and material_hint.strip() else None
-
-        t0 = time.time()
-        hf_corrected, report = correct_heightfield(hf, config, store=store, material_hint=mat)
-        elapsed = time.time() - t0
-
-        corr_path = OUT / "heightfields" / "heightfield_corrected.npy"
-        corr_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(str(corr_path), hf_corrected)
-
-        info = (
-            f"**Fabrication Correction 完成** ({elapsed:.2f}s)\n\n"
-            f"- 形态学修改像素: {report.morph_pixels_changed:,}\n"
-            f"- 应用约束: {', '.join(report.constraints_applied)}\n"
-            f"- 语义指导: {', '.join(report.guidance_used)}\n"
-            f"- 已保存: `{corr_path.relative_to(ROOT)}`"
-        )
-
-        filter_report_json = ""
-        hf_display = hf_corrected
-
-        if apply_machining_filter:
-            import json as _json
-            from machining_filter import (
-                MachiningFilterConfig,
-                filter_heightfield_for_machining,
-                save_report_json as save_mf_report,
-                save_heightfield as save_machinable,
-            )
-            mf_cfg = MachiningFilterConfig(
-                physical_size_mm=float(physical_size),
-                max_height_mm=float(max_height),
-                tool_radius_mm=float(tool_radius),
-            )
-            hf_machinable, mf_report = filter_heightfield_for_machining(hf_corrected, mf_cfg)
-            mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
-            save_machinable(hf_machinable, mac_path)
-            rpt_path = OUT / "heightfields" / "machining_filter_report.json"
-            save_mf_report(mf_report, rpt_path)
-            # Save geometry params so Tab 6 uses the exact same values
-            cfg_path = OUT / "heightfields" / "heightfield_machinable_config.json"
-            with open(cfg_path, "w") as _f:
-                _json.dump({
-                    "max_height_mm": float(max_height),
-                    "physical_size_mm": float(physical_size),
-                }, _f, indent=2)
-            import dataclasses
-            filter_report_json = _json.dumps(dataclasses.asdict(mf_report), indent=2)
-            hf_display = hf_machinable
-            info += (
-                f"\n\n**Machining Filter 完成**\n"
-                f"- 台阶数: {mf_report.terrace_steps_applied}\n"
-                f"- Machinable 已保存: `{mac_path.relative_to(ROOT)}`"
-            )
-
-        return _arr_to_uint8(hf), _arr_to_uint8(hf_display), info, filter_report_json
-    except Exception as e:
-        raise gr.Error(f"Fabrication Correction 失败: {e}")
-
-
 # ===== 4. Geometry (STL) ====================================================
 
 def _load_best_heightfield(heightfield_file) -> tuple[np.ndarray, str]:
-    """Load heightfield: uploaded > machinable > corrected > raw > synthetic."""
+    """Load heightfield: uploaded > raw > synthetic."""
     if heightfield_file is not None:
         return np.load(heightfield_file), "uploaded"
-    machinable = OUT / "heightfields" / "heightfield_machinable.npy"
-    if machinable.exists():
-        return np.load(str(machinable)), str(machinable.relative_to(ROOT))
-    corrected = OUT / "heightfields" / "heightfield_corrected.npy"
-    if corrected.exists():
-        return np.load(str(corrected)), str(corrected.relative_to(ROOT))
     raw = OUT / "heightfields" / "heightfield.npy"
     if raw.exists():
         return np.load(str(raw)), str(raw.relative_to(ROOT))
@@ -357,9 +265,6 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
                     terrace_mode: bool = False, terrace_steps: int = 5,
                     mesh_resolution: int = 256):
     try:
-        import json as _json
-
-        # Load heightfield based on source choice
         if hf_source_choice == "terrace":
             terr_path = OUT / "heightfields" / "heightfield_terrace.npy"
             hf = np.load(str(terr_path)) if terr_path.exists() else _make_test_heightfield()
@@ -368,25 +273,8 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
             raw_path = OUT / "heightfields" / "heightfield_raw.npy"
             hf = np.load(str(raw_path)) if raw_path.exists() else _make_test_heightfield()
             hf_source = "raw (heightfield_raw.npy)"
-        elif hf_source_choice == "machinable":
-            mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
-            hf = np.load(str(mac_path)) if mac_path.exists() else _make_test_heightfield()
-            hf_source = "machinable (heightfield_machinable.npy)"
-            cfg_path = OUT / "heightfields" / "heightfield_machinable_config.json"
-            if cfg_path.exists():
-                with open(cfg_path) as _f:
-                    _mac_cfg = _json.load(_f)
-                max_height = _mac_cfg["max_height_mm"]
-                physical_size = _mac_cfg["physical_size_mm"]
         else:
             hf, hf_source = _load_best_heightfield(heightfield_file)
-
-        # Load machining filter report if available
-        filter_report_json = ""
-        report_path = OUT / "heightfields" / "machining_filter_report.json"
-        if report_path.exists():
-            with open(report_path) as f:
-                filter_report_json = _json.dumps(_json.load(f), indent=2)
 
         from fabrication import FabricationConfig, check_mesh
 
@@ -449,7 +337,7 @@ def run_fabrication(heightfield_file, hf_source_choice: str,
             f"{extra_rows}\n"
             f"**问题列表:**\n{issues_str}"
         )
-        return info, filter_report_json
+        return info
     except Exception as e:
         raise gr.Error(f"Fabrication Check 失败: {e}")
 
@@ -589,42 +477,6 @@ def build_app() -> gr.Blocks:
                 outputs=[out_diff_img, out_diff_info],
             )
 
-        # ---- Tab 3.5: Fabrication Correction ----
-        with gr.Tab("3.5 Fabrication Correction"):
-            gr.Markdown("对高度场进行加工约束修正：最小特征尺寸、形态学滤波\n\n"
-                        "基于 Memory Store (RAG) 检索加工知识并自适应修正。\n"
-                        "勾选 **Apply machining filter** 可在修正后追加台阶化后处理，"
-                        "生成 `heightfield_machinable.npy`。")
-            inp_corr_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
-            with gr.Row():
-                inp_corr_size = gr.Number(label="Physical size (mm)", value=50.0)
-                inp_corr_h = gr.Number(label="Max height (mm)", value=5.0)
-                inp_corr_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-            inp_corr_mat = gr.Textbox(label="材料提示 (可选)", placeholder="e.g. wood, bark, concrete")
-            inp_corr_filter = gr.Checkbox(
-                label="Apply machining filter (terracing + sub-tool-feature suppression)",
-                value=False,
-            )
-            btn_corr = gr.Button("运行 Fabrication Correction", variant="primary")
-            with gr.Row():
-                out_corr_before = gr.Image(label="修正前高度场")
-                out_corr_after = gr.Image(label="修正后高度场 / Machinable")
-            out_corr_info = gr.Markdown()
-            out_corr_filter_json = gr.Code(
-                label="Machining Filter Report (JSON)", language="json", visible=False
-            )
-            inp_corr_filter.change(
-                fn=lambda x: gr.update(visible=x),
-                inputs=inp_corr_filter,
-                outputs=out_corr_filter_json,
-            )
-            btn_corr.click(
-                run_fabrication_correction,
-                inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_mat, inp_corr_filter],
-                outputs=[out_corr_before, out_corr_after, out_corr_info, out_corr_filter_json],
-            )
-
         # ---- Tab 4: Geometry ----
         with gr.Tab("4. Geometry (STL)"):
             gr.Markdown(
@@ -680,7 +532,7 @@ def build_app() -> gr.Blocks:
             )
             inp_fab_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             inp_fab_source = gr.Dropdown(
-                choices=["auto", "raw", "machinable", "terrace"],
+                choices=["auto", "raw", "terrace"],
                 value="auto",
                 label="Heightfield source (terrace = heightfield_terrace.npy)",
             )
@@ -697,15 +549,12 @@ def build_app() -> gr.Blocks:
                 inp_fab_h = gr.Number(label="Max height (mm)", value=5.0)
             btn_fab = gr.Button("运行 Fabrication Check", variant="primary")
             out_fab_info = gr.Markdown()
-            out_fab_filter_json = gr.Code(
-                label="Machining Filter Report (JSON)", language="json"
-            )
             btn_fab.click(
                 run_fabrication,
                 inputs=[inp_fab_file, inp_fab_source, inp_fab_tr,
                         inp_fab_size, inp_fab_h,
                         inp_fab_terrace, inp_fab_steps, inp_fab_res],
-                outputs=[out_fab_info, out_fab_filter_json],
+                outputs=out_fab_info,
             )
 
     return app

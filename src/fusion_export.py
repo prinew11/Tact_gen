@@ -63,7 +63,7 @@ def prepare_for_fusion(
         f"Tool          : Ball end mill  r={tool_radius_mm} mm\n"
         f"Stepover      : {stepover_mm} mm\n"
         f"Post processor: grbl.cps  (see fusion/grbl.cps)\n"
-        f"Max slope     : {report.max_slope_deg:.1f}° (limit 45°)\n"
+        f"Max slope     : {report.max_slope_deg:.1f}° (informational)\n"
         f"Face count    : {report.face_count:,}\n"
         f"\nSteps:\n"
         f"  1. Import {dest_stl.name} into Fusion 360\n"
