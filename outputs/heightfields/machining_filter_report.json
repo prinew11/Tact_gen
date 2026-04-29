@@ -9,19 +9,16 @@
   ],
   "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
-  "terrace_steps_applied": 100,
-  "step_height_mm": 0.20202020202020202,
-  "plateau_fraction": 0.525363336516624,
-  "max_plateau_slope_deg": 0.0,
-  "max_raw_slope_deg": 83.03484344482422,
-  "min_feature_target_mm": 4.0,
-  "morph_radius_px": 7.039999999999999,
-  "features_amplified": false,
+  "min_feature_target_mm": 6.0,
+  "min_feature_estimate_mm": 6.0,
+  "smoothing_sigma_px": 0.0,
+  "morph_radius_px": 10.559999999999999,
+  "terrace_steps_applied": 1,
   "passed": true,
   "issues": [],
   "recommendations": [
-    "Downsampled 512\u2192353 px for face budget",
-    "Dropped features with prominence < 0.50 mm.",
-    "100 terrace levels, step height 0.20 mm. Vertical risers are machinable by the ball mill's side; plateau fraction = 52.5%."
+    "Downsampled 512\u2192353 px to satisfy face budget",
+    "Sub-6 mm recesses suppressed via morphological opening (tool diameter 6.0 mm)",
+    "Terrace mode: Gaussian smoothing skipped. Quantisation is handled by heightfield_to_terrace_mesh()."
   ]
 }

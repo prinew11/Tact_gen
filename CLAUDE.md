@@ -14,9 +14,8 @@ using an img2img diffusion pipeline.
 2. Tactile feature mapping (roughness, directionality, frequency descriptors)
 3. img2img diffusion generation → single-channel heightfield
 4. Geometry conversion: heightfield → triangular mesh → STL
-5. Fabrication check (slope, tool radius, watertightness)
-6. Mockup Geometry → visualize model(.OBJ/.STL)
-7. Fusion 360 CAM → 3D Parallel Toolpath → GRBL Post Processor → .gcode
+5. Mockup Geometry → visualize model(.OBJ/.STL)
+6. Fusion 360 CAM → 3D Parallel Toolpath → GRBL Post Processor → .gcode
 
 ## Mockup Module
 - Purpose: Low-res preview mesh for visual confirmation before CAM

@@ -17,7 +17,7 @@ class FabricationConfig:
     min_feedrate_mm_min: float = 45.0 # GRBL hard lower limit
     physical_size_mm: float = 100.0   # XY extent for GRBL workspace check
     max_height_mm: float = 10.0       # Z range
-    base_thickness_mm: float = 2.0    # flat bottom
+    base_thickness_mm: float = 10.0   # flat bottom stock
 
 
 @dataclass

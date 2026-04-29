@@ -124,121 +124,151 @@ def run_diffusion(image: np.ndarray | None, steps: int):
         raise gr.Error(f"Diffusion 失败: {e}")
 
 
-# ===== 3.5 Machining Filter (ADC quantisation) =============================
+# ===== Helpers ==============================================================
 
-def run_machining_filter(heightfield_file, physical_size, max_height,
-                         tool_radius, max_slope, terrace_steps,
-                         amplify_features, apply_morph, min_prominence):
-    try:
-        if heightfield_file is not None:
-            hf = np.load(heightfield_file)
-        else:
-            default = OUT / "heightfields" / "heightfield.npy"
-            hf = np.load(str(default)) if default.exists() else _make_test_heightfield()
+def _render_heightmap_3d(hf: np.ndarray, physical_size: float, max_height: float,
+                         base_thickness: float = 0.0, title: str = "") -> np.ndarray:
+    """3D surface preview of a heightfield."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-        import json as _json
-        import dataclasses
-        from machining_filter import (
-            MachiningFilterConfig,
-            filter_heightfield_for_machining,
-            save_report_json,
-            save_heightfield as save_machinable,
-        )
+    h, w = hf.shape
+    xs = np.linspace(0, physical_size, w)
+    ys = np.linspace(0, physical_size, h)
+    X, Y = np.meshgrid(xs, ys)
+    Z = np.flipud(hf) * max_height + base_thickness
 
-        cfg = MachiningFilterConfig(
-            physical_size_mm=float(physical_size),
-            max_height_mm=float(max_height),
-            tool_radius_mm=float(tool_radius),
-            max_slope_deg=float(max_slope),
-            terrace_steps=int(terrace_steps),
-            amplify_features=bool(amplify_features),
-            apply_morph_opening=bool(apply_morph),
-            min_feature_prominence_mm=float(min_prominence),
-        )
-
-        t0 = time.time()
-        hf_out, report = filter_heightfield_for_machining(hf, cfg)
-        elapsed = time.time() - t0
-
-        mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
-        save_machinable(hf_out, mac_path)
-        rpt_path = OUT / "heightfields" / "machining_filter_report.json"
-        save_report_json(report, rpt_path)
-        cfg_path = OUT / "heightfields" / "heightfield_machinable_config.json"
-        with open(cfg_path, "w") as _f:
-            _json.dump({
-                "max_height_mm": float(max_height),
-                "physical_size_mm": float(physical_size),
-            }, _f, indent=2)
-
-        info = (
-            f"**Machining Filter 完成** ({elapsed:.2f}s)\n\n"
-            f"| 指标 | 值 |\n"
-            f"|---|---|\n"
-            f"| 台阶数 (ADC levels) | {report.terrace_steps_applied} |\n"
-            f"| 台阶高度 | {report.step_height_mm:.2f} mm |\n"
-            f"| Plateau 占比 | {report.plateau_fraction * 100:.1f}% |\n"
-            f"| Plateau slope (max) | {report.max_plateau_slope_deg:.1f}° |\n"
-            f"| Raw slope (含 riser) | {report.max_raw_slope_deg:.1f}° |\n"
-            f"| Pixel size | {report.pixel_size_mm:.3f} mm |\n"
-            f"| Estimated faces | {report.estimated_face_count:,} |\n\n"
-            f"- Machinable 已保存: `{mac_path.relative_to(ROOT)}`\n"
-            f"- 报告: `{rpt_path.relative_to(ROOT)}`"
-        )
-        if report.recommendations:
-            info += "\n\n**Notes:**\n" + "\n".join(f"- {r}" for r in report.recommendations)
-        if report.issues:
-            info += "\n\n**Issues:**\n" + "\n".join(f"- {i}" for i in report.issues)
-
-        filter_report_json = _json.dumps(dataclasses.asdict(report), indent=2)
-        return _arr_to_uint8(hf), _arr_to_uint8(hf_out), info, filter_report_json
-    except Exception as e:
-        raise gr.Error(f"Machining Filter 失败: {e}")
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(X, Y, Z, cmap="terrain", linewidth=0, antialiased=False, rcount=100, ccount=100)
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.set_zlabel("Z (mm)")
+    ax.set_zlim(0, max_height + base_thickness if base_thickness else max_height)
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)[:, :, :3].copy()
+    plt.close(fig)
+    return img
 
 
-# ===== 4. Geometry (STL) ====================================================
+# ===== 4. Geometry (machining filter + STL) =================================
 
 def _load_best_heightfield(heightfield_file) -> tuple[np.ndarray, str]:
-    """Load heightfield: uploaded > machinable > raw > synthetic."""
+    """Load heightfield: uploaded > raw > synthetic."""
     if heightfield_file is not None:
         return np.load(heightfield_file), "uploaded"
-    machinable = OUT / "heightfields" / "heightfield_machinable.npy"
-    if machinable.exists():
-        return np.load(str(machinable)), str(machinable.relative_to(ROOT))
     raw = OUT / "heightfields" / "heightfield.npy"
     if raw.exists():
         return np.load(str(raw)), str(raw.relative_to(ROOT))
     return _make_test_heightfield(), "synthetic test"
 
 
-def run_geometry(heightfield_file, physical_size: float, max_height: float):
+def run_geometry(heightfield_file, physical_size: float, max_height: float,
+                 tool_radius: float,
+                 terrace_mode: bool, terrace_steps: int,
+                 mesh_resolution: int):
+    """One-shot pipeline: raw heightfield → machinable heightmap → STL.
+
+    Returns (machinable_hf_2d_preview, stl_3d_preview, info_markdown).
+    """
     try:
-        hf, hf_source = _load_best_heightfield(heightfield_file)
-
-        from geometry import GeometryConfig, heightfield_to_mesh, save_stl
-
-        config = GeometryConfig(
-            physical_size_mm=physical_size,
-            max_height_mm=max_height,
+        from terrace_geometry import (
+            MachiningFilterConfig, filter_heightfield_for_machining,
+            save_heightfield as save_machinable,
+            save_report_json,
+            TerraceConfig, preprocess_for_terrace,
+            heightfield_to_terrace_mesh,
+            save_stl as terrace_save_stl,
         )
+
+        hf, hf_source = _load_best_heightfield(heightfield_file)
         t0 = time.time()
-        mesh = heightfield_to_mesh(hf, config)
+
+        # --- Step 1: Machining filter → machinable heightmap ---
+        mf_cfg = MachiningFilterConfig(
+            physical_size_mm=float(physical_size),
+            max_height_mm=float(max_height),
+            tool_radius_mm=float(tool_radius),
+            terrace_steps=int(terrace_steps) if not terrace_mode else 1,
+            terrace_mode=bool(terrace_mode),
+        )
+        hf_machinable, mf_report = filter_heightfield_for_machining(hf, mf_cfg)
+        mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
+        save_machinable(hf_machinable, mac_path)
+        save_report_json(mf_report, OUT / "heightfields" / "machining_filter_report.json")
+
+        # --- Step 2: Build STL ---
+        if terrace_mode:
+            hf_for_mesh = preprocess_for_terrace(
+                hf_machinable,
+                tool_diameter_mm=tool_radius * 2.0,
+                physical_size_mm=physical_size,
+                target_resolution=int(mesh_resolution),
+            )
+            t_cfg = TerraceConfig(
+                physical_size_mm=physical_size,
+                max_height_mm=max_height,
+                terrace_steps=int(terrace_steps),
+                tool_diameter_mm=tool_radius * 2.0,
+                mesh_resolution=int(mesh_resolution),
+            )
+            mesh, t_report = heightfield_to_terrace_mesh(hf_for_mesh, t_cfg)
+            stl_path = OUT / "stl_fabrication" / "tactile_terrace.stl"
+            terrace_save_stl(mesh, stl_path)
+            base_thickness = t_cfg.base_thickness_mm
+            mesh_info = (
+                f"- Mesh 类型: terrace\n"
+                f"- 台阶数: {t_cfg.terrace_steps}\n"
+                f"- 网格分辨率: {mesh_resolution}×{mesh_resolution}\n"
+                f"- 顶点数: {t_report.vertex_count:,}\n"
+                f"- 面数: {t_report.face_count:,}\n"
+                f"- 水密性: {t_report.watertight}"
+            )
+        else:
+            from geometry import GeometryConfig, heightfield_to_mesh, save_stl
+            g_cfg = GeometryConfig(
+                physical_size_mm=physical_size,
+                max_height_mm=max_height,
+            )
+            mesh = heightfield_to_mesh(hf_machinable, g_cfg)
+            stl_path = OUT / "stl_fabrication" / "tactile.stl"
+            save_stl(mesh, stl_path)
+            base_thickness = g_cfg.base_thickness_mm
+            mesh_info = (
+                f"- Mesh 类型: smooth\n"
+                f"- 顶点数: {len(mesh.vertices):,}\n"
+                f"- 面数: {len(mesh.faces):,}\n"
+                f"- 水密性: {mesh.is_watertight}"
+            )
         elapsed = time.time() - t0
 
-        stl_path = OUT / "stl_fabrication" / "tactile.stl"
-        save_stl(mesh, stl_path)
+        # --- Previews ---
+        hf_preview = _arr_to_uint8(hf_machinable)
+        stl_preview = _render_heightmap_3d(
+            hf_machinable, physical_size, max_height,
+            base_thickness=base_thickness,
+            title=f"STL preview ({stl_path.name})",
+        )
 
         info = (
-            f"**Geometry 模块测试通过**\n\n"
-            f"- 输入来��: {hf_source}\n"
-            f"- 输入高度场: {hf.shape}\n"
-            f"- 顶点数: {len(mesh.vertices):,}\n"
-            f"- 面数: {len(mesh.faces):,}\n"
-            f"- 水密性: {mesh.is_watertight}\n"
-            f"- 构建耗时: {elapsed:.2f}s\n"
-            f"- STL 已保存: `{stl_path.relative_to(ROOT)}`"
+            f"**Pipeline 完成** ({elapsed:.2f}s)\n\n"
+            f"- 输入来源: {hf_source}\n"
+            f"- Machinable 已保存: `{mac_path.relative_to(ROOT)}`\n"
+            f"- STL 已保存: `{stl_path.relative_to(ROOT)}`\n\n"
+            f"**Machining Filter**\n"
+            f"- 台阶数: {mf_report.terrace_steps_applied}\n"
+            f"- Pixel size: {mf_report.pixel_size_mm:.3f} mm\n"
+            f"- Min feature: {mf_report.min_feature_target_mm:.1f} mm\n\n"
+            f"**Mesh**\n{mesh_info}"
         )
-        return _arr_to_uint8(hf), info
+        if mf_report.issues:
+            info += "\n\n**Issues:**\n" + "\n".join(f"- {i}" for i in mf_report.issues)
+        return hf_preview, stl_preview, info
     except Exception as e:
         raise gr.Error(f"Geometry 失败: {e}")
 
@@ -284,76 +314,6 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
         return plot_img, info
     except Exception as e:
         raise gr.Error(f"Mockup 失败: {e}")
-
-
-# ===== 6. Fabrication Check =================================================
-
-def run_fabrication(heightfield_file, hf_source_choice: str,
-                    tool_radius: float, max_slope: float,
-                    physical_size: float, max_height: float):
-    try:
-        import json as _json
-
-        # Load heightfield based on source choice
-        if hf_source_choice == "raw":
-            raw_path = OUT / "heightfields" / "heightfield.npy"
-            hf = np.load(str(raw_path)) if raw_path.exists() else _make_test_heightfield()
-            hf_source = "raw (heightfield.npy)"
-        elif hf_source_choice == "machinable":
-            mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
-            hf = np.load(str(mac_path)) if mac_path.exists() else _make_test_heightfield()
-            hf_source = "machinable (heightfield_machinable.npy)"
-            # Override geometry params with the values stored when the filter ran
-            cfg_path = OUT / "heightfields" / "heightfield_machinable_config.json"
-            if cfg_path.exists():
-                with open(cfg_path) as _f:
-                    _mac_cfg = _json.load(_f)
-                max_height = _mac_cfg["max_height_mm"]
-                physical_size = _mac_cfg["physical_size_mm"]
-        else:
-            hf, hf_source = _load_best_heightfield(heightfield_file)
-
-        # Load machining filter report if available
-        filter_report_json = ""
-        report_path = OUT / "heightfields" / "machining_filter_report.json"
-        if report_path.exists():
-            with open(report_path) as f:
-                filter_report_json = _json.dumps(_json.load(f), indent=2)
-
-        from geometry import GeometryConfig, heightfield_to_mesh
-        from fabrication import FabricationConfig, check_mesh
-
-        geo_cfg = GeometryConfig(
-            physical_size_mm=physical_size,
-            max_height_mm=max_height,
-        )
-        mesh = heightfield_to_mesh(hf, geo_cfg)
-        config = FabricationConfig(
-            tool_radius_mm=tool_radius,
-            max_slope_deg=max_slope,
-            physical_size_mm=physical_size,
-            max_height_mm=max_height,
-        )
-        report = check_mesh(mesh, config)
-
-        status = "PASS" if report.passes else "FAIL"
-        issues_str = "\n".join(f"  - {i}" for i in report.issues) if report.issues else "  无"
-
-        info = (
-            f"**Fabrication 检查结果: {status}**\n\n"
-            f"- 输入来源: {hf_source}\n\n"
-            f"| 检查项 | 结果 |\n"
-            f"|---|---|\n"
-            f"| 水密性 | {report.watertight} |\n"
-            f"| 面数 | {report.face_count:,} |\n"
-            f"| 最大坡度 (仅顶面) | {report.max_slope_deg:.1f}° (限制 {max_slope}°) |\n"
-            f"| 网格间距 | {report.grid_spacing_mm:.3f} mm |\n"
-            f"| GRBL 兼容 | {report.grbl_compatible} |\n\n"
-            f"**问题列表:**\n{issues_str}"
-        )
-        return info, filter_report_json
-    except Exception as e:
-        raise gr.Error(f"Fabrication Check 失败: {e}")
 
 
 # ===== 7. 环境检查 ==========================================================
@@ -491,64 +451,41 @@ def build_app() -> gr.Blocks:
                 outputs=[out_diff_img, out_diff_info],
             )
 
-        # ---- Tab 3.5: Machining Filter (ADC quantisation) ----
-        with gr.Tab("3.5 Machining Filter"):
+        # ---- Tab 4: Geometry (machining filter + STL) ----
+        with gr.Tab("4. Geometry (Machinable + STL)"):
             gr.Markdown(
-                "ADC 量化：把相近高度合并成离散台阶，减少加工面、消除 plateau 坡度。\n\n"
-                "Riser（台阶墙）保持 ~90°，球头铣刀可用侧刃加工。"
+                "一次跑完：machining filter 生成可加工 heightmap，再构建 STL。"
+                "两种输出都会预览 + 保存到磁盘。"
             )
-            inp_corr_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
-            with gr.Row():
-                inp_corr_size = gr.Number(label="Physical size (mm)", value=100.0)
-                inp_corr_h = gr.Number(label="Max height (mm)", value=10.0)
-                inp_corr_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-            inp_corr_slope = gr.Slider(20, 60, value=45, step=1, label="Plateau 最大坡度 (°)")
-            inp_corr_steps = gr.Number(
-                label="Terrace steps (0 = auto, 1 = disable)", value=0, precision=0,
-            )
-            inp_corr_amplify = gr.Checkbox(
-                label="放大小于刀径的凸特征 (widen sub-tool peaks to survive morph)",
-                value=True,
-            )
-            inp_corr_morph = gr.Checkbox(
-                label="启用 morph opening（关闭后 STL 保留视觉细节，但小凹槽实际刀做不出来）",
-                value=True,
-            )
-            inp_corr_prom = gr.Slider(
-                0.0, 3.0, value=0.0, step=0.05,
-                label="最小特征显著度 (mm) — 低于此值的小起伏会被拍平（0 = 保留所有）",
-            )
-            btn_corr = gr.Button("运行 Machining Filter", variant="primary")
-            with gr.Row():
-                out_corr_before = gr.Image(label="输入高度场")
-                out_corr_after = gr.Image(label="量化后 (machinable)")
-            out_corr_info = gr.Markdown()
-            out_corr_filter_json = gr.Code(
-                label="Machining Filter Report (JSON)", language="json",
-            )
-            btn_corr.click(
-                run_machining_filter,
-                inputs=[inp_corr_file, inp_corr_size, inp_corr_h, inp_corr_tr,
-                        inp_corr_slope, inp_corr_steps, inp_corr_amplify,
-                        inp_corr_morph, inp_corr_prom],
-                outputs=[out_corr_before, out_corr_after, out_corr_info, out_corr_filter_json],
-            )
-
-        # ---- Tab 4: Geometry ----
-        with gr.Tab("4. Geometry (STL)"):
-            gr.Markdown("加载 .npy 高度场 → 生成防水 STL\n\n"
-                        "不上传文件则使用 `outputs/heightfields/heightfield.npy` 或自动生成测试数据。")
             inp_geo_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
             with gr.Row():
                 inp_geo_size = gr.Number(label="Physical size (mm)", value=100.0)
                 inp_geo_h = gr.Number(label="Max height (mm)", value=10.0)
-            btn_geo = gr.Button("运行 Geometry", variant="primary")
-            out_geo_img = gr.Image(label="高度场预览")
+                inp_geo_tr = gr.Number(label="Tool radius (mm)", value=3.0)
+            with gr.Row():
+                inp_geo_steps = gr.Slider(
+                    0, 50, value=5, step=1,
+                    label="Terrace 台阶数（0 = auto，smooth 模式下忽略）",
+                )
+                inp_geo_res = gr.Slider(
+                    64, 512, value=256, step=32,
+                    label="Terrace mesh 分辨率（仅 terrace mode）",
+                )
+            inp_geo_terrace = gr.Checkbox(
+                label="Terrace mode（输出锐利台阶 STL）",
+                value=False,
+            )
+            btn_geo = gr.Button("运行", variant="primary")
+            with gr.Row():
+                out_geo_hf = gr.Image(label="Machinable heightmap (2D)")
+                out_geo_stl = gr.Image(label="STL 3D 预览")
             out_geo_info = gr.Markdown()
             btn_geo.click(
                 run_geometry,
-                inputs=[inp_geo_file, inp_geo_size, inp_geo_h],
-                outputs=[out_geo_img, out_geo_info],
+                inputs=[inp_geo_file, inp_geo_size, inp_geo_h,
+                        inp_geo_tr,
+                        inp_geo_terrace, inp_geo_steps, inp_geo_res],
+                outputs=[out_geo_hf, out_geo_stl, out_geo_info],
             )
 
         # ---- Tab 5: Mockup ----
@@ -565,37 +502,6 @@ def build_app() -> gr.Blocks:
                 run_mockup,
                 inputs=[inp_moc_file, inp_moc_size, inp_moc_h],
                 outputs=[out_moc_img, out_moc_info],
-            )
-
-        # ---- Tab 6: Fabrication Check ----
-        with gr.Tab("6. Fabrication Check"):
-            gr.Markdown(
-                "加载高度场 → 构建 mesh → 检查水密性/面数/坡度(仅顶面)/最小特征/GRBL兼容\n\n"
-                "优先使用 machinable 高度场 (`heightfield_machinable.npy`)。\n"
-                "**刀具直径 6 mm** — 小于 6 mm 的凹槽/沟道将被报告为问题。"
-            )
-            inp_fab_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
-            inp_fab_source = gr.Dropdown(
-                choices=["auto", "raw", "machinable"],
-                value="auto",
-                label="Heightfield source (auto = best available)",
-            )
-            with gr.Row():
-                inp_fab_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-                inp_fab_slope = gr.Number(label="Max slope (°)", value=45.0)
-            with gr.Row():
-                inp_fab_size = gr.Number(label="Physical size (mm)", value=100.0)
-                inp_fab_h = gr.Number(label="Max height (mm)", value=10.0)
-            btn_fab = gr.Button("运行 Fabrication Check", variant="primary")
-            out_fab_info = gr.Markdown()
-            out_fab_filter_json = gr.Code(
-                label="Machining Filter Report (JSON)", language="json"
-            )
-            btn_fab.click(
-                run_fabrication,
-                inputs=[inp_fab_file, inp_fab_source, inp_fab_tr, inp_fab_slope,
-                        inp_fab_size, inp_fab_h],
-                outputs=[out_fab_info, out_fab_filter_json],
             )
 
     return app

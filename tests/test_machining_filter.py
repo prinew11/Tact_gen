@@ -10,7 +10,7 @@ import json
 import numpy as np
 import pytest
 
-from machining_filter import (
+from terrace_geometry import (
     MachiningFilterConfig,
     MachiningFilterReport,
     compute_pixel_size_mm,
