@@ -88,6 +88,131 @@ def run_tactile_mapping(image: np.ndarray | None):
         raise gr.Error(f"Tactile Mapping 失败: {e}")
 
 
+# ===== 2.5 Smart Crop =======================================================
+
+def _local_roughness_map(gray: np.ndarray, win: int) -> np.ndarray:
+    """Local std of intensity — high where texture varies fine."""
+    import cv2
+    mean = cv2.boxFilter(gray, -1, (win, win))
+    sq_mean = cv2.boxFilter(gray * gray, -1, (win, win))
+    var = np.clip(sq_mean - mean * mean, 0.0, None)
+    return np.sqrt(var)
+
+
+def _local_directionality_map(gray: np.ndarray, win: int) -> np.ndarray:
+    """Structure-tensor coherence — high where edges align in one direction."""
+    import cv2
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    Jxx = cv2.boxFilter(gx * gx, -1, (win, win))
+    Jyy = cv2.boxFilter(gy * gy, -1, (win, win))
+    Jxy = cv2.boxFilter(gx * gy, -1, (win, win))
+    tr = Jxx + Jyy
+    disc = np.sqrt(np.maximum((Jxx - Jyy) ** 2 * 0.25 + Jxy * Jxy, 0.0))
+    l1, l2 = tr * 0.5 + disc, tr * 0.5 - disc
+    return ((l1 - l2) / (l1 + l2 + 1e-8)).astype(np.float32)
+
+
+def _local_frequency_map(gray: np.ndarray) -> np.ndarray:
+    """|Laplacian| — proxy for high spatial frequency content per pixel."""
+    import cv2
+    return np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+
+
+def _normalize01(x: np.ndarray) -> np.ndarray:
+    lo = float(x.min())
+    rng = float(x.max() - lo)
+    return ((x - lo) / rng).astype(np.float32) if rng > 1e-8 else np.zeros_like(x, np.float32)
+
+
+def run_smart_crop(image: np.ndarray | None, crop_fraction: float,
+                   w_rough: float, w_dir: float, w_freq: float,
+                   mode: str, manual_cx_frac: float, manual_cy_frac: float):
+    """Smart crop v3: weighted local features + auto/manual crop position."""
+    if image is None:
+        raise gr.Error("请先上传一张图片")
+    try:
+        import cv2
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        h, w = gray.shape
+        side = int(min(h, w) * float(crop_fraction))
+        side = max(side, 16)
+        side = min(side, min(h, w))
+
+        # Local feature window for roughness/directionality estimation —
+        # smaller than the crop window so the score has spatial structure.
+        local_win = max(side // 8, 5)
+        if local_win % 2 == 0:
+            local_win += 1
+
+        R = _normalize01(_local_roughness_map(gray, local_win))
+        D = _normalize01(_local_directionality_map(gray, local_win))
+        F = _normalize01(_local_frequency_map(gray))
+
+        # Normalize weights to sum to 1 so absolute slider values are decoupled
+        wsum = max(float(w_rough) + float(w_dir) + float(w_freq), 1e-6)
+        wr, wd, wf = w_rough / wsum, w_dir / wsum, w_freq / wsum
+        score_pixel = wr * R + wd * D + wf * F
+
+        # Window-mean to find the best crop center
+        score = cv2.boxFilter(score_pixel, ddepth=-1, ksize=(side, side))
+
+        half = side // 2
+        cx_lo, cx_hi = half, w - (side - half)
+        cy_lo, cy_hi = half, h - (side - half)
+
+        if mode == "Manual":
+            cx = int(round(float(manual_cx_frac) * w))
+            cy = int(round(float(manual_cy_frac) * h))
+            cx = max(cx_lo, min(cx_hi - 1, cx))
+            cy = max(cy_lo, min(cy_hi - 1, cy))
+        else:
+            valid_mask = np.zeros_like(score, dtype=bool)
+            valid_mask[cy_lo:cy_hi, cx_lo:cx_hi] = True
+            score_masked = np.where(valid_mask, score, -1.0)
+            cy, cx = np.unravel_index(int(np.argmax(score_masked)), score.shape)
+
+        y0, y1 = cy - half, cy - half + side
+        x0, x1 = cx - half, cx - half + side
+        cropped = image[y0:y1, x0:x1].copy()
+
+        # Heatmap overlay
+        heat = (_normalize01(score) * 255).astype(np.uint8)
+        heat_color = cv2.applyColorMap(heat, cv2.COLORMAP_INFERNO)
+        heat_color = cv2.cvtColor(heat_color, cv2.COLOR_BGR2RGB)
+        overlay = cv2.addWeighted(image.astype(np.uint8), 0.55, heat_color, 0.45, 0)
+        cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (255, 80, 80), 3)
+
+        out_dir = OUT / "cropped"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "cropped_input.png"
+        cv2.imwrite(str(out_path), cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR))
+
+        # Per-region descriptor values to help the user understand why
+        crop_R = float(R[y0:y1, x0:x1].mean())
+        crop_D = float(D[y0:y1, x0:x1].mean())
+        crop_F = float(F[y0:y1, x0:x1].mean())
+
+        info = (
+            f"**Smart Crop v3 完成** ({mode})\n\n"
+            f"- 输入尺寸: {w}×{h}\n"
+            f"- 裁剪尺寸: {side}×{side} ({crop_fraction*100:.0f}% of min side)\n"
+            f"- 裁剪中心: ({cx}, {cy})  归一化: ({cx/w:.3f}, {cy/h:.3f})\n"
+            f"- 范围: x[{x0}:{x1}], y[{y0}:{y1}]\n\n"
+            f"**权重（归一化）**: rough={wr:.2f}, dir={wd:.2f}, freq={wf:.2f}\n\n"
+            f"**裁剪区域内平均**\n"
+            f"- 粗糙度: {crop_R:.3f}\n"
+            f"- 方向一致性: {crop_D:.3f}\n"
+            f"- 频率（|Laplacian|）: {crop_F:.3f}\n"
+            f"- 总分: {float(score[cy, cx]):.3f}\n\n"
+            f"已保存: `{out_path.relative_to(ROOT)}`"
+        )
+        return overlay, cropped, info
+    except Exception as e:
+        raise gr.Error(f"Smart Crop 失败: {e}")
+
+
 # ===== 3. Diffusion Pipeline ===============================================
 
 def run_diffusion(image: np.ndarray | None, steps: int):
@@ -435,6 +560,51 @@ def build_app() -> gr.Blocks:
             btn_tac = gr.Button("运行 Tactile Mapping", variant="primary")
             out_tac = gr.Markdown()
             btn_tac.click(run_tactile_mapping, inputs=inp_tac_img, outputs=out_tac)
+
+        # ---- Tab 2.5: Smart Crop ----
+        with gr.Tab("2.5 Smart Crop"):
+            gr.Markdown(
+                "图片细节太密、刀加工不出来时，自动或手动定位裁剪区域。\n\n"
+                "**Auto**：argmax of (粗糙度 + 方向性 + 频率) 加权热力图。\n"
+                "**Manual**：用 X / Y 滑块对照热力图手动选位置。"
+            )
+            inp_crop_img = gr.Image(label="输入图片", type="numpy")
+            inp_crop_frac = gr.Slider(
+                0.2, 1.0, value=0.5, step=0.05,
+                label="裁剪边长 / 原图较短边",
+            )
+            with gr.Row():
+                inp_crop_w_rough = gr.Slider(
+                    0.0, 2.0, value=1.0, step=0.1, label="粗糙度权重",
+                )
+                inp_crop_w_dir = gr.Slider(
+                    0.0, 2.0, value=0.5, step=0.1, label="方向性权重",
+                )
+                inp_crop_w_freq = gr.Slider(
+                    0.0, 2.0, value=1.0, step=0.1, label="频率权重",
+                )
+            inp_crop_mode = gr.Radio(
+                choices=["Auto", "Manual"], value="Auto", label="裁剪定位模式",
+            )
+            with gr.Row():
+                inp_crop_mx = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01, label="手动 X 中心 (归一化)",
+                )
+                inp_crop_my = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01, label="手动 Y 中心 (归一化)",
+                )
+            btn_crop = gr.Button("运行", variant="primary")
+            with gr.Row():
+                out_crop_overlay = gr.Image(label="特征热力图 + 裁剪框")
+                out_crop_image = gr.Image(label="裁剪结果")
+            out_crop_info = gr.Markdown()
+            btn_crop.click(
+                run_smart_crop,
+                inputs=[inp_crop_img, inp_crop_frac,
+                        inp_crop_w_rough, inp_crop_w_dir, inp_crop_w_freq,
+                        inp_crop_mode, inp_crop_mx, inp_crop_my],
+                outputs=[out_crop_overlay, out_crop_image, out_crop_info],
+            )
 
         # ---- Tab 3: Diffusion ----
         with gr.Tab("3. Diffusion Pipeline"):

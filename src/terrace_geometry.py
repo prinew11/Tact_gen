@@ -437,6 +437,51 @@ def _enforce_min_recess_width(
     return result
 
 
+def _enforce_min_plateau_size(
+    labels: np.ndarray,
+    tool_radius_px: float,
+    n_levels: int,
+    max_iters: int = 10,
+) -> np.ndarray:
+    """
+    Ensure every plateau (region at exactly level L) is wide enough to fit the
+    tool footprint.  Pixels that fail per-level binary OPENING with a tool-disk
+    structuring element are reassigned to the dominant neighbour level
+    (majority vote within the disk, excluding self).  Iterates until stable.
+    """
+    if n_levels <= 1 or tool_radius_px < 0.5:
+        return labels.copy()
+
+    from scipy.ndimage import convolve as nd_convolve
+
+    r = max(int(math.ceil(tool_radius_px)), 1)
+    yi, xi = np.ogrid[-r: r + 1, -r: r + 1]
+    disk = (xi ** 2 + yi ** 2 <= r ** 2).astype(np.uint8)
+
+    nbr_kernel = disk.astype(np.int32).copy()
+    nbr_kernel[r, r] = 0   # exclude center → counts only neighbours
+
+    result = labels.copy()
+    for _ in range(max_iters):
+        narrow = np.zeros(result.shape, dtype=bool)
+        for level in range(n_levels):
+            mask = (result == level).astype(np.uint8)
+            if not mask.any():
+                continue
+            opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, disk)
+            narrow |= (mask == 1) & (opened == 0)
+        if not narrow.any():
+            break
+        counts = np.stack(
+            [nd_convolve((result == lv).astype(np.int32), nbr_kernel, mode="constant")
+             for lv in range(n_levels)],
+            axis=-1,
+        )
+        new_labels = np.argmax(counts, axis=-1).astype(result.dtype)
+        result = np.where(narrow, new_labels, result)
+    return result
+
+
 def _z_of_label(
     label: int,
     n_levels: int,
@@ -491,6 +536,10 @@ def heightfield_to_terrace_mesh(
 
     # Step 2: Enforce minimum recess width (6 mm hard rule).
     labels = _enforce_min_recess_width(labels, tool_radius_px, n)
+
+    # Step 2b: Enforce minimum plateau size — every per-level region must fit
+    # the tool footprint (≥ tool_diameter × tool_diameter).
+    labels = _enforce_min_plateau_size(labels, tool_radius_px, n)
 
     # Step 3: Resolve checkerboard saddle points that produce non-manifold edges.
     labels = _resolve_checkerboard(labels)
