@@ -9,8 +9,11 @@
   ],
   "pixel_size_mm": 0.2840909090909091,
   "estimated_face_count": 498432,
+  "max_slope_deg_before": 58.92880630493164,
+  "max_slope_deg_after": 42.047786712646484,
   "min_feature_target_mm": 6.0,
   "min_feature_estimate_mm": 6.0,
+  "height_scale_applied": 1.0,
   "smoothing_sigma_px": 0.0,
   "morph_radius_px": 10.559999999999999,
   "terrace_steps_applied": 1,
@@ -19,6 +22,6 @@
   "recommendations": [
     "Downsampled 512\u2192353 px to satisfy face budget",
     "Sub-6 mm recesses suppressed via morphological opening (tool diameter 6.0 mm)",
-    "Terrace mode: Gaussian smoothing skipped. Quantisation is handled by heightfield_to_terrace_mesh()."
+    "Terrace mode: Gaussian smoothing and slope compression skipped. Quantisation is handled by heightfield_to_terrace_mesh()."
   ]
 }

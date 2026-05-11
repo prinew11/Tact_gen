@@ -33,7 +33,7 @@ def _arr_to_uint8(arr: np.ndarray) -> np.ndarray:
 
 def run_preprocessing(image: np.ndarray | None):
     if image is None:
-        raise gr.Error("请先上传一张图片")
+        raise gr.Error("Please upload an image first.")
     try:
         import cv2
         from preprocessing import load_image_gray, extract_edges, extract_frequency
@@ -45,22 +45,22 @@ def run_preprocessing(image: np.ndarray | None):
         freq = extract_frequency(gray)
 
         info = (
-            f"**Preprocessing 模块测试通过**\n\n"
-            f"- 输出尺寸: {gray.shape}\n"
-            f"- Gray 范围: [{gray.min():.3f}, {gray.max():.3f}]\n"
-            f"- Edges 非零像素: {(edges > 0).sum():,}\n"
-            f"- Frequency 均值: {freq.mean():.4f}"
+            f"**Preprocessing passed**\n\n"
+            f"- Output shape: {gray.shape}\n"
+            f"- Gray range: [{gray.min():.3f}, {gray.max():.3f}]\n"
+            f"- Edges non-zero pixels: {(edges > 0).sum():,}\n"
+            f"- Frequency mean: {freq.mean():.4f}"
         )
         return _arr_to_uint8(gray), _arr_to_uint8(edges), _arr_to_uint8(freq), info
     except Exception as e:
-        raise gr.Error(f"Preprocessing 失败: {e}")
+        raise gr.Error(f"Preprocessing failed: {e}")
 
 
 # ===== 2. Tactile Mapping ===================================================
 
 def run_tactile_mapping(image: np.ndarray | None):
     if image is None:
-        raise gr.Error("请先上传一张图片")
+        raise gr.Error("Please upload an image first.")
     try:
         import cv2
         from preprocessing import extract_edges, extract_frequency
@@ -76,16 +76,16 @@ def run_tactile_mapping(image: np.ndarray | None):
         desc = map_features(features)
 
         info = (
-            f"**Tactile Mapping 模块测试通过**\n\n"
-            f"| 指标 | 值 |\n"
+            f"**Tactile Mapping passed**\n\n"
+            f"| Metric | Value |\n"
             f"|---|---|\n"
-            f"| Roughness (粗糙度) | {desc.roughness:.4f} |\n"
-            f"| Directionality (方向性) | {desc.directionality:.4f} |\n"
-            f"| Frequency (频率) | {desc.frequency:.4f} |"
+            f"| Roughness | {desc.roughness:.4f} |\n"
+            f"| Directionality | {desc.directionality:.4f} |\n"
+            f"| Frequency | {desc.frequency:.4f} |"
         )
         return info
     except Exception as e:
-        raise gr.Error(f"Tactile Mapping 失败: {e}")
+        raise gr.Error(f"Tactile Mapping failed: {e}")
 
 
 # ===== 2.5 Smart Crop =======================================================
@@ -130,7 +130,7 @@ def run_smart_crop(image: np.ndarray | None, crop_fraction: float,
                    mode: str, manual_cx_frac: float, manual_cy_frac: float):
     """Smart crop v3: weighted local features + auto/manual crop position."""
     if image is None:
-        raise gr.Error("请先上传一张图片")
+        raise gr.Error("Please upload an image first.")
     try:
         import cv2
 
@@ -195,29 +195,29 @@ def run_smart_crop(image: np.ndarray | None, crop_fraction: float,
         crop_F = float(F[y0:y1, x0:x1].mean())
 
         info = (
-            f"**Smart Crop v3 完成** ({mode})\n\n"
-            f"- 输入尺寸: {w}×{h}\n"
-            f"- 裁剪尺寸: {side}×{side} ({crop_fraction*100:.0f}% of min side)\n"
-            f"- 裁剪中心: ({cx}, {cy})  归一化: ({cx/w:.3f}, {cy/h:.3f})\n"
-            f"- 范围: x[{x0}:{x1}], y[{y0}:{y1}]\n\n"
-            f"**权重（归一化）**: rough={wr:.2f}, dir={wd:.2f}, freq={wf:.2f}\n\n"
-            f"**裁剪区域内平均**\n"
-            f"- 粗糙度: {crop_R:.3f}\n"
-            f"- 方向一致性: {crop_D:.3f}\n"
-            f"- 频率（|Laplacian|）: {crop_F:.3f}\n"
-            f"- 总分: {float(score[cy, cx]):.3f}\n\n"
-            f"已保存: `{out_path.relative_to(ROOT)}`"
+            f"**Smart Crop v3 done** ({mode})\n\n"
+            f"- Input size: {w}x{h}\n"
+            f"- Crop size: {side}x{side} ({crop_fraction*100:.0f}% of min side)\n"
+            f"- Crop center: ({cx}, {cy})  Normalized: ({cx/w:.3f}, {cy/h:.3f})\n"
+            f"- Range: x[{x0}:{x1}], y[{y0}:{y1}]\n\n"
+            f"**Weights (normalized)**: rough={wr:.2f}, dir={wd:.2f}, freq={wf:.2f}\n\n"
+            f"**Region averages**\n"
+            f"- Roughness: {crop_R:.3f}\n"
+            f"- Directionality: {crop_D:.3f}\n"
+            f"- Frequency (|Laplacian|): {crop_F:.3f}\n"
+            f"- Score: {float(score[cy, cx]):.3f}\n\n"
+            f"Saved: `{out_path.relative_to(ROOT)}`"
         )
         return overlay, cropped, info
     except Exception as e:
-        raise gr.Error(f"Smart Crop 失败: {e}")
+        raise gr.Error(f"Smart Crop failed: {e}")
 
 
 # ===== 3. Diffusion Pipeline ===============================================
 
 def run_diffusion(image: np.ndarray | None, steps: int):
     if image is None:
-        raise gr.Error("请先上传一张图片")
+        raise gr.Error("Please upload an image first.")
     try:
         import cv2
         from diffusion_pipeline import DiffusionConfig, generate_heightfield
@@ -234,19 +234,19 @@ def run_diffusion(image: np.ndarray | None, steps: int):
         np.save(str(hf_raw_path), hf)
 
         info = "\n".join([
-            f"**Diffusion 模块测试通过（使用本地训练模型）**\n",
+            f"**Diffusion passed (local trained model)**\n",
             f"- Checkpoint: `{config.trained_model_path}`",
-            f"- 设备: {config.device}",
-            f"- 采样步数: {config.num_inference_steps}",
-            f"- 耗时: {elapsed:.1f}s",
-            f"- 高度场范围: [{hf.min():.3f}, {hf.max():.3f}]",
-            f"- Raw 已保存: `{hf_raw_path.relative_to(ROOT)}`",
+            f"- Device: {config.device}",
+            f"- Sampling steps: {config.num_inference_steps}",
+            f"- Elapsed: {elapsed:.1f}s",
+            f"- Heightfield range: [{hf.min():.3f}, {hf.max():.3f}]",
+            f"- Saved: `{hf_raw_path.relative_to(ROOT)}`",
         ])
         return _arr_to_uint8(hf), info
     except FileNotFoundError as e:
-        raise gr.Error(f"Diffusion 失败: {e}")
+        raise gr.Error(f"Diffusion failed: {e}")
     except Exception as e:
-        raise gr.Error(f"Diffusion 失败: {e}")
+        raise gr.Error(f"Diffusion failed: {e}")
 
 
 # ===== Helpers ==============================================================
@@ -262,7 +262,7 @@ def _render_heightmap_3d(hf: np.ndarray, physical_size: float, max_height: float
     xs = np.linspace(0, physical_size, w)
     ys = np.linspace(0, physical_size, h)
     X, Y = np.meshgrid(xs, ys)
-    Z = np.flipud(hf) * max_height + base_thickness
+    Z = hf * max_height + base_thickness
 
     fig = plt.figure(figsize=(6, 5))
     ax = fig.add_subplot(111, projection="3d")
@@ -293,109 +293,102 @@ def _load_best_heightfield(heightfield_file) -> tuple[np.ndarray, str]:
     return _make_test_heightfield(), "synthetic test"
 
 
-def run_geometry(heightfield_file, physical_size: float, max_height: float,
-                 tool_radius: float,
-                 terrace_mode: bool, terrace_steps: int,
-                 mesh_resolution: int):
-    """One-shot pipeline: raw heightfield → machinable heightmap → STL.
+# ===== 4. Saliency-Guided Geometry ==========================================
 
-    Returns (machinable_hf_2d_preview, stl_3d_preview, info_markdown).
-    """
+def run_saliency_geometry(
+    heightfield_file,
+    physical_size: float, max_height: float, tool_radius: float,
+    steps_high: int, steps_low: int,
+    thresh_high: float, thresh_low: float,
+    mesh_resolution: int,
+    fft_stride: int, fft_energy_threshold: float, weight_blur_sigma: float,
+    structure_sigma: float, tool_angle: float, tool_tolerance: float,
+):
+    """Multi-scale FFT + structure tensor + height range → machinability-weighted terrace."""
     try:
         from terrace_geometry import (
-            MachiningFilterConfig, filter_heightfield_for_machining,
-            save_heightfield as save_machinable,
-            save_report_json,
-            TerraceConfig, preprocess_for_terrace,
-            heightfield_to_terrace_mesh,
-            save_stl as terrace_save_stl,
+            MachiningFilterConfig, TerraceConfig, SaliencyConfig,
+            run_saliency_pipeline, save_stl as terrace_save_stl,
         )
 
         hf, hf_source = _load_best_heightfield(heightfield_file)
+        hf_raw_path = OUT / "heightfields" / "heightfield_raw.npy"
+        hf_raw_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(hf_raw_path), hf)
+
         t0 = time.time()
-
-        # --- Step 1: Machining filter → machinable heightmap ---
-        mf_cfg = MachiningFilterConfig(
-            physical_size_mm=float(physical_size),
-            max_height_mm=float(max_height),
-            tool_radius_mm=float(tool_radius),
-            terrace_steps=int(terrace_steps) if not terrace_mode else 1,
-            terrace_mode=bool(terrace_mode),
-        )
-        hf_machinable, mf_report = filter_heightfield_for_machining(hf, mf_cfg)
-        mac_path = OUT / "heightfields" / "heightfield_machinable.npy"
-        save_machinable(hf_machinable, mac_path)
-        save_report_json(mf_report, OUT / "heightfields" / "machining_filter_report.json")
-
-        # --- Step 2: Build STL ---
-        if terrace_mode:
-            hf_for_mesh = preprocess_for_terrace(
-                hf_machinable,
-                tool_diameter_mm=tool_radius * 2.0,
-                physical_size_mm=physical_size,
-                target_resolution=int(mesh_resolution),
-            )
-            t_cfg = TerraceConfig(
-                physical_size_mm=physical_size,
-                max_height_mm=max_height,
-                terrace_steps=int(terrace_steps),
-                tool_diameter_mm=tool_radius * 2.0,
+        mesh, hf_processed, mach_report, ter_report, sal_report = run_saliency_pipeline(
+            raw_heightmap_path=str(hf_raw_path),
+            config=MachiningFilterConfig(
+                physical_size_mm=float(physical_size),
+                max_height_mm=float(max_height),
+                tool_radius_mm=float(tool_radius),
+                max_slope_deg=40.0,
+            ),
+            terrace_config=TerraceConfig(
+                physical_size_mm=float(physical_size),
+                max_height_mm=float(max_height),
+                base_thickness_mm=2.0,
+                tool_diameter_mm=float(tool_radius) * 2.0,
                 mesh_resolution=int(mesh_resolution),
-            )
-            mesh, t_report = heightfield_to_terrace_mesh(hf_for_mesh, t_cfg)
-            stl_path = OUT / "stl_fabrication" / "tactile_terrace.stl"
-            terrace_save_stl(mesh, stl_path)
-            base_thickness = t_cfg.base_thickness_mm
-            mesh_info = (
-                f"- Mesh 类型: terrace\n"
-                f"- 台阶数: {t_cfg.terrace_steps}\n"
-                f"- 网格分辨率: {mesh_resolution}×{mesh_resolution}\n"
-                f"- 顶点数: {t_report.vertex_count:,}\n"
-                f"- 面数: {t_report.face_count:,}\n"
-                f"- 水密性: {t_report.watertight}"
-            )
-        else:
-            from geometry import GeometryConfig, heightfield_to_mesh, save_stl
-            g_cfg = GeometryConfig(
-                physical_size_mm=physical_size,
-                max_height_mm=max_height,
-            )
-            mesh = heightfield_to_mesh(hf_machinable, g_cfg)
-            stl_path = OUT / "stl_fabrication" / "tactile.stl"
-            save_stl(mesh, stl_path)
-            base_thickness = g_cfg.base_thickness_mm
-            mesh_info = (
-                f"- Mesh 类型: smooth\n"
-                f"- 顶点数: {len(mesh.vertices):,}\n"
-                f"- 面数: {len(mesh.faces):,}\n"
-                f"- 水密性: {mesh.is_watertight}"
-            )
+            ),
+            saliency_config=SaliencyConfig(
+                fft_stride=int(fft_stride),
+                fft_energy_threshold=float(fft_energy_threshold),
+                weight_blur_sigma=float(weight_blur_sigma),
+                structure_sigma=float(structure_sigma),
+                tool_angle_deg=float(tool_angle),
+                tool_tolerance_mm=float(tool_tolerance),
+                terrace_steps_high=int(steps_high),
+                terrace_steps_low=int(steps_low),
+                saliency_threshold_high=float(thresh_high),
+                saliency_threshold_low=float(thresh_low),
+            ),
+            save_saliency_map=str(OUT / "weight_map.png"),
+        )
         elapsed = time.time() - t0
 
-        # --- Previews ---
-        hf_preview = _arr_to_uint8(hf_machinable)
+        stl_path = OUT / "stl_fabrication" / "saliency_guided_terrace.stl"
+        terrace_save_stl(mesh, stl_path)
+
+        weight_map_img = np.array(
+            __import__("PIL").Image.open(str(OUT / "weight_map.png"))
+        )
+
+        hf_preview = _arr_to_uint8(hf_processed)
         stl_preview = _render_heightmap_3d(
-            hf_machinable, physical_size, max_height,
-            base_thickness=base_thickness,
-            title=f"STL preview ({stl_path.name})",
+            hf_processed, physical_size, max_height,
+            base_thickness=2.0,
+            title="Saliency-Guided Terrace",
         )
 
         info = (
-            f"**Pipeline 完成** ({elapsed:.2f}s)\n\n"
-            f"- 输入来源: {hf_source}\n"
-            f"- Machinable 已保存: `{mac_path.relative_to(ROOT)}`\n"
-            f"- STL 已保存: `{stl_path.relative_to(ROOT)}`\n\n"
+            f"**Machinability Pipeline done** ({elapsed:.2f}s)\n\n"
+            f"- Input source: {hf_source}\n"
+            f"- STL saved: `{stl_path.relative_to(ROOT)}`\n\n"
+            f"**Weight Report**\n"
+            f"- Mean weight: {sal_report.weight_mean:.3f}\n"
+            f"- High-weight fraction: {sal_report.high_weight_fraction:.1%}\n"
+            f"- Low-weight fraction: {sal_report.low_weight_fraction:.1%}\n"
+            f"- Mean period: {sal_report.mean_period_px:.1f} px\n"
+            f"- Mean coherence: {sal_report.mean_coherence:.3f}\n"
+            f"- Mean height range: {sal_report.mean_height_range_mm:.3f} mm\n"
+            f"- Non-periodic fraction: {sal_report.non_periodic_fraction:.1%}\n\n"
             f"**Machining Filter**\n"
-            f"- 台阶数: {mf_report.terrace_steps_applied}\n"
-            f"- Pixel size: {mf_report.pixel_size_mm:.3f} mm\n"
-            f"- Min feature: {mf_report.min_feature_target_mm:.1f} mm\n\n"
-            f"**Mesh**\n{mesh_info}"
+            f"- Pixel size: {mach_report.pixel_size_mm:.3f} mm\n"
+            f"- Passed: {mach_report.passed}\n\n"
+            f"**Terrace Mesh**\n"
+            f"- Terrace steps: {steps_low}–{steps_high} (adaptive)\n"
+            f"- Grid resolution: {mesh_resolution}x{mesh_resolution}\n"
+            f"- Faces: {ter_report.face_count:,}\n"
+            f"- Watertight: {ter_report.watertight}"
         )
-        if mf_report.issues:
-            info += "\n\n**Issues:**\n" + "\n".join(f"- {i}" for i in mf_report.issues)
-        return hf_preview, stl_preview, info
+        if mach_report.issues:
+            info += "\n\n**Issues:**\n" + "\n".join(f"- {i}" for i in mach_report.issues)
+
+        return hf_preview, stl_preview, weight_map_img, info
     except Exception as e:
-        raise gr.Error(f"Geometry 失败: {e}")
+        raise gr.Error(f"Saliency pipeline failed: {e}")
 
 
 # ===== 5. Mockup (OBJ preview) =============================================
@@ -430,18 +423,18 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
         plt.close(fig)
 
         info = (
-            f"**Mockup 模块测试通过**\n\n"
-            f"- 输出分辨率: 256×256\n"
-            f"- Z 放大倍数: 2.0×\n"
-            f"- 构建耗时: {elapsed:.2f}s\n"
-            f"- OBJ 已保存: `{obj_path.relative_to(ROOT)}`"
+            f"**Mockup passed**\n\n"
+            f"- Output resolution: 256x256\n"
+            f"- Z scale factor: 2.0x\n"
+            f"- Build time: {elapsed:.2f}s\n"
+            f"- OBJ saved: `{obj_path.relative_to(ROOT)}`"
         )
         return plot_img, info
     except Exception as e:
-        raise gr.Error(f"Mockup 失败: {e}")
+        raise gr.Error(f"Mockup failed: {e}")
 
 
-# ===== 7. 环境检查 ==========================================================
+# ===== 7. Environment Check =================================================
 
 def run_env_check():
     results = []
@@ -457,57 +450,57 @@ def run_env_check():
         import cv2
         results.append(f"- OpenCV: {cv2.__version__}")
     except ImportError:
-        results.append("- OpenCV: **未安装**")
+        results.append("- OpenCV: **not installed**")
 
     # torch
     try:
         import torch
         cuda = torch.cuda.is_available()
-        gpu_name = torch.cuda.get_device_name(0) if cuda else "无"
+        gpu_name = torch.cuda.get_device_name(0) if cuda else "N/A"
         results.append(f"- PyTorch: {torch.__version__}")
-        results.append(f"- CUDA 可用: {cuda}  |  GPU: {gpu_name}")
+        results.append(f"- CUDA available: {cuda}  |  GPU: {gpu_name}")
     except ImportError:
-        results.append("- PyTorch: **未安装**")
+        results.append("- PyTorch: **not installed**")
 
     # diffusers
     try:
         import diffusers
         results.append(f"- Diffusers: {diffusers.__version__}")
     except ImportError:
-        results.append("- Diffusers: **未安装**")
+        results.append("- Diffusers: **not installed**")
 
     # trimesh
     try:
         import trimesh
         results.append(f"- Trimesh: {trimesh.__version__}")
     except ImportError:
-        results.append("- Trimesh: **未安装**")
+        results.append("- Trimesh: **not installed**")
 
     # PIL
     try:
         import PIL
         results.append(f"- Pillow: {PIL.__version__}")
     except ImportError:
-        results.append("- Pillow: **未安装**")
+        results.append("- Pillow: **not installed**")
 
     # matplotlib
     try:
         import matplotlib
         results.append(f"- Matplotlib: {matplotlib.__version__}")
     except ImportError:
-        results.append("- Matplotlib: **未安装**")
+        results.append("- Matplotlib: **not installed**")
 
     # scipy
     try:
         import scipy
         results.append(f"- SciPy: {scipy.__version__}")
     except ImportError:
-        results.append("- SciPy: **未安装**")
+        results.append("- SciPy: **not installed**")
 
     # gradio
     results.append(f"- Gradio: {gr.__version__}")
 
-    return "**环境检查结果**\n\n" + "\n".join(results)
+    return "**Environment Check Results**\n\n" + "\n".join(results)
 
 
 # ===== test heightfield ====================================================
@@ -526,27 +519,27 @@ def _make_test_heightfield(size: int = 512) -> np.ndarray:
 # ===== Build UI =============================================================
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Tactile Geometry — 模块测试", theme=gr.themes.Soft()) as app:
-        gr.Markdown("# Tactile Geometry Generation — 模块测试面板")
-        gr.Markdown("上传图片或加载 .npy 高度场，逐模块测试 pipeline 是否正常运行。")
+    with gr.Blocks(title="Tactile Geometry — Module Test", theme=gr.themes.Soft()) as app:
+        gr.Markdown("# Tactile Geometry Generation — Module Test Panel")
+        gr.Markdown("Upload an image or load a .npy heightfield to test each pipeline module.")
 
-        # ---- Tab 0: 环境检查 ----
-        with gr.Tab("0. 环境检查"):
-            gr.Markdown("点击按钮检查所有依赖库是否已安装。")
-            btn_env = gr.Button("检查环境", variant="primary")
+        # ---- Tab 0: Environment Check ----
+        with gr.Tab("0. Environment Check"):
+            gr.Markdown("Click the button to check if all dependencies are installed.")
+            btn_env = gr.Button("Check Environment", variant="primary")
             out_env = gr.Markdown()
             btn_env.click(run_env_check, outputs=out_env)
 
         # ---- Tab 1: Preprocessing ----
         with gr.Tab("1. Preprocessing"):
-            gr.Markdown("上传图片 → 灰度图 / 边缘检测 / 高频特征")
+            gr.Markdown("Upload image -> Grayscale / Edge detection / High-frequency features")
             with gr.Row():
-                inp_pre_img = gr.Image(label="输入图片", type="numpy")
-            btn_pre = gr.Button("运行 Preprocessing", variant="primary")
+                inp_pre_img = gr.Image(label="Input Image", type="numpy")
+            btn_pre = gr.Button("Run Preprocessing", variant="primary")
             with gr.Row():
-                out_pre_gray = gr.Image(label="灰度图")
-                out_pre_edge = gr.Image(label="边缘检测")
-                out_pre_freq = gr.Image(label="高频特征")
+                out_pre_gray = gr.Image(label="Grayscale")
+                out_pre_edge = gr.Image(label="Edge Detection")
+                out_pre_freq = gr.Image(label="High Frequency")
             out_pre_info = gr.Markdown()
             btn_pre.click(
                 run_preprocessing, inputs=inp_pre_img,
@@ -555,48 +548,48 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 2: Tactile Mapping ----
         with gr.Tab("2. Tactile Mapping"):
-            gr.Markdown("上传图片 → 计算触觉描述符（粗糙度/方向性/频率）")
-            inp_tac_img = gr.Image(label="输入图片", type="numpy")
-            btn_tac = gr.Button("运行 Tactile Mapping", variant="primary")
+            gr.Markdown("Upload image -> Compute tactile descriptors (roughness / directionality / frequency)")
+            inp_tac_img = gr.Image(label="Input Image", type="numpy")
+            btn_tac = gr.Button("Run Tactile Mapping", variant="primary")
             out_tac = gr.Markdown()
             btn_tac.click(run_tactile_mapping, inputs=inp_tac_img, outputs=out_tac)
 
         # ---- Tab 2.5: Smart Crop ----
         with gr.Tab("2.5 Smart Crop"):
             gr.Markdown(
-                "图片细节太密、刀加工不出来时，自动或手动定位裁剪区域。\n\n"
-                "**Auto**：argmax of (粗糙度 + 方向性 + 频率) 加权热力图。\n"
-                "**Manual**：用 X / Y 滑块对照热力图手动选位置。"
+                "When texture details are too fine for the tool, auto or manual crop region selection.\n\n"
+                "**Auto**: argmax of weighted (roughness + directionality + frequency) heatmap.\n"
+                "**Manual**: use X/Y sliders to select position from heatmap."
             )
-            inp_crop_img = gr.Image(label="输入图片", type="numpy")
+            inp_crop_img = gr.Image(label="Input Image", type="numpy")
             inp_crop_frac = gr.Slider(
                 0.2, 1.0, value=0.5, step=0.05,
-                label="裁剪边长 / 原图较短边",
+                label="Crop side / shorter image side",
             )
             with gr.Row():
                 inp_crop_w_rough = gr.Slider(
-                    0.0, 2.0, value=1.0, step=0.1, label="粗糙度权重",
+                    0.0, 2.0, value=1.0, step=0.1, label="Roughness weight",
                 )
                 inp_crop_w_dir = gr.Slider(
-                    0.0, 2.0, value=0.5, step=0.1, label="方向性权重",
+                    0.0, 2.0, value=0.5, step=0.1, label="Directionality weight",
                 )
                 inp_crop_w_freq = gr.Slider(
-                    0.0, 2.0, value=1.0, step=0.1, label="频率权重",
+                    0.0, 2.0, value=1.0, step=0.1, label="Frequency weight",
                 )
             inp_crop_mode = gr.Radio(
-                choices=["Auto", "Manual"], value="Auto", label="裁剪定位模式",
+                choices=["Auto", "Manual"], value="Auto", label="Crop positioning mode",
             )
             with gr.Row():
                 inp_crop_mx = gr.Slider(
-                    0.0, 1.0, value=0.5, step=0.01, label="手动 X 中心 (归一化)",
+                    0.0, 1.0, value=0.5, step=0.01, label="Manual X center (normalized)",
                 )
                 inp_crop_my = gr.Slider(
-                    0.0, 1.0, value=0.5, step=0.01, label="手动 Y 中心 (归一化)",
+                    0.0, 1.0, value=0.5, step=0.01, label="Manual Y center (normalized)",
                 )
-            btn_crop = gr.Button("运行", variant="primary")
+            btn_crop = gr.Button("Run", variant="primary")
             with gr.Row():
-                out_crop_overlay = gr.Image(label="特征热力图 + 裁剪框")
-                out_crop_image = gr.Image(label="裁剪结果")
+                out_crop_overlay = gr.Image(label="Feature heatmap + crop box")
+                out_crop_image = gr.Image(label="Cropped result")
             out_crop_info = gr.Markdown()
             btn_crop.click(
                 run_smart_crop,
@@ -608,11 +601,11 @@ def build_app() -> gr.Blocks:
 
         # ---- Tab 3: Diffusion ----
         with gr.Tab("3. Diffusion Pipeline"):
-            gr.Markdown("上传图片 → 本地训练模型 → 生成高度场\n\n"
-                        "**需要先训练模型**：`python src/training/train.py`")
-            inp_diff_img = gr.Image(label="输入图片", type="numpy")
-            inp_diff_steps = gr.Slider(10, 100, value=50, step=1, label="采样步数")
-            btn_diff = gr.Button("运行 Diffusion", variant="primary")
+            gr.Markdown("Upload image -> Local trained model -> Generate heightfield\n\n"
+                        "**Train model first**: `python src/training/train.py`")
+            inp_diff_img = gr.Image(label="Input Image", type="numpy")
+            inp_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Sampling steps")
+            btn_diff = gr.Button("Run Diffusion", variant="primary")
             out_diff_img = gr.Image(label="Raw heightfield")
             out_diff_info = gr.Markdown()
             btn_diff.click(
@@ -621,52 +614,99 @@ def build_app() -> gr.Blocks:
                 outputs=[out_diff_img, out_diff_info],
             )
 
-        # ---- Tab 4: Geometry (machining filter + STL) ----
-        with gr.Tab("4. Geometry (Machinable + STL)"):
+        # ---- Tab 4: Saliency-Guided Geometry ----
+        with gr.Tab("4. Saliency-Guided Terrace"):
             gr.Markdown(
-                "一次跑完：machining filter 生成可加工 heightmap，再构建 STL。"
-                "两种输出都会预览 + 保存到磁盘。"
+                "Multi-scale FFT + structure tensor + height range → machinability weight.\n\n"
+                "Weight = w_period x w_orientation x w_height_range. "
+                "All three conditions must be satisfied for full preservation.\n\n"
+                "- **Period**: multi-scale FFT (32/64/128px), energy-weighted average\n"
+                "- **Orientation**: structure tensor coherence x alignment with toolpath\n"
+                "- **Height range**: peak-valley difference; negligible features (< tolerance) are smoothed"
             )
-            inp_geo_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
+            inp_sal_file = gr.File(label="Upload raw heightfield .npy", file_types=[".npy"])
             with gr.Row():
-                inp_geo_size = gr.Number(label="Physical size (mm)", value=100.0)
-                inp_geo_h = gr.Number(label="Max height (mm)", value=10.0)
-                inp_geo_tr = gr.Number(label="Tool radius (mm)", value=3.0)
+                inp_sal_size = gr.Number(label="Physical size (mm)", value=100.0)
+                inp_sal_h = gr.Number(label="Max height (mm)", value=5.0)
+                inp_sal_tr = gr.Number(label="Tool radius (mm)", value=3.0)
             with gr.Row():
-                inp_geo_steps = gr.Slider(
-                    0, 50, value=5, step=1,
-                    label="Terrace 台阶数（0 = auto，smooth 模式下忽略）",
+                inp_sal_steps_hi = gr.Slider(
+                    4, 24, value=12, step=1,
+                    label="Terrace steps (high weight / machinable)",
                 )
-                inp_geo_res = gr.Slider(
+                inp_sal_steps_lo = gr.Slider(
+                    2, 12, value=4, step=1,
+                    label="Terrace steps (low weight / coarse)",
+                )
+            with gr.Row():
+                inp_sal_thresh_hi = gr.Slider(
+                    0.3, 0.9, value=0.65, step=0.05,
+                    label="Weight threshold (high)",
+                )
+                inp_sal_thresh_lo = gr.Slider(
+                    0.1, 0.6, value=0.30, step=0.05,
+                    label="Weight threshold (low)",
+                )
+            gr.Markdown("**FFT analysis** (multi-scale: 32 / 64 / 128 px)")
+            with gr.Row():
+                inp_sal_fft_stride = gr.Slider(
+                    4, 64, value=16, step=4,
+                    label="FFT stride (px)",
+                )
+                inp_sal_fft_thresh = gr.Slider(
+                    0.05, 0.5, value=0.20, step=0.05,
+                    label="Energy threshold (non-periodic detection)",
+                )
+            gr.Markdown("**Structure tensor & height range**")
+            with gr.Row():
+                inp_sal_struct_sigma = gr.Slider(
+                    4.0, 20.0, value=10.0, step=1.0,
+                    label="Structure tensor sigma (px)",
+                )
+                inp_sal_tool_angle = gr.Slider(
+                    0, 180, value=0, step=5,
+                    label="Toolpath angle (deg, 0=horizontal)",
+                )
+                inp_sal_tolerance = gr.Slider(
+                    0.01, 0.20, value=0.05, step=0.01,
+                    label="Tool tolerance (mm)",
+                )
+            with gr.Row():
+                inp_sal_blur = gr.Slider(
+                    1.0, 20.0, value=8.0, step=1.0,
+                    label="Weight blur sigma (px)",
+                )
+                inp_sal_mesh_res = gr.Slider(
                     64, 512, value=256, step=32,
-                    label="Terrace mesh 分辨率（仅 terrace mode）",
+                    label="Mesh resolution",
                 )
-            inp_geo_terrace = gr.Checkbox(
-                label="Terrace mode（输出锐利台阶 STL）",
-                value=False,
-            )
-            btn_geo = gr.Button("运行", variant="primary")
+            btn_sal = gr.Button("Run Saliency Pipeline", variant="primary")
             with gr.Row():
-                out_geo_hf = gr.Image(label="Machinable heightmap (2D)")
-                out_geo_stl = gr.Image(label="STL 3D 预览")
-            out_geo_info = gr.Markdown()
-            btn_geo.click(
-                run_geometry,
-                inputs=[inp_geo_file, inp_geo_size, inp_geo_h,
-                        inp_geo_tr,
-                        inp_geo_terrace, inp_geo_steps, inp_geo_res],
-                outputs=[out_geo_hf, out_geo_stl, out_geo_info],
+                out_sal_hf = gr.Image(label="Machinable heightmap (2D)")
+                out_sal_stl = gr.Image(label="STL 3D preview")
+            out_sal_saliency = gr.Image(label="Machinability weight map")
+            out_sal_info = gr.Markdown()
+            btn_sal.click(
+                run_saliency_geometry,
+                inputs=[inp_sal_file,
+                        inp_sal_size, inp_sal_h, inp_sal_tr,
+                        inp_sal_steps_hi, inp_sal_steps_lo,
+                        inp_sal_thresh_hi, inp_sal_thresh_lo,
+                        inp_sal_mesh_res,
+                        inp_sal_fft_stride, inp_sal_fft_thresh, inp_sal_blur,
+                        inp_sal_struct_sigma, inp_sal_tool_angle, inp_sal_tolerance],
+                outputs=[out_sal_hf, out_sal_stl, out_sal_saliency, out_sal_info],
             )
 
         # ---- Tab 5: Mockup ----
         with gr.Tab("5. Mockup (OBJ)"):
-            gr.Markdown("加载 .npy 高度场 → 256*256 低精度 OBJ 预览)")
-            inp_moc_file = gr.File(label="上传 .npy (可选)", file_types=[".npy"])
+            gr.Markdown("Load .npy heightfield -> 256x256 low-res OBJ preview")
+            inp_moc_file = gr.File(label="Upload .npy (optional)", file_types=[".npy"])
             with gr.Row():
                 inp_moc_size = gr.Number(label="Physical size (mm)", value=100.0)
                 inp_moc_h = gr.Number(label="Max height (mm)", value=10.0)
-            btn_moc = gr.Button("运行 Mockup", variant="primary")
-            out_moc_img = gr.Image(label="Mockup 渲染")
+            btn_moc = gr.Button("Run Mockup", variant="primary")
+            out_moc_img = gr.Image(label="Mockup Render")
             out_moc_info = gr.Markdown()
             btn_moc.click(
                 run_mockup,
