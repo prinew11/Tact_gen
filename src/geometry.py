@@ -17,8 +17,8 @@ class GeometryConfig:
     resolution: int = 512          # heightfield grid size
     mesh_resolution: int = 350     # downsample to this for STL (keeps face count < 500K)
     physical_size_mm: float = 50.0 # physical XY extent in mm
-    max_height_mm: float = 5.0     # Z range in mm
-    base_thickness_mm: float = 2.0 # flat bottom thickness in mm
+    max_height_mm: float = 20.0    # Z range in mm
+    base_thickness_mm: float = 3.0 # flat bottom thickness in mm
     face_limit: int = 500_000      # decimate to this after building grid mesh
 
 

@@ -19,7 +19,7 @@ def generate_mockup(
     heightfield: np.ndarray,
     out_path: str | Path,
     physical_size_mm: float = 50.0,
-    max_height_mm: float = 5.0,
+    max_height_mm: float = 20.0,
 ) -> Path:
     """
     Downsample heightfield to 256x256, apply 2x Z-exaggeration, export as OBJ.

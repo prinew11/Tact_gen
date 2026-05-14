@@ -30,9 +30,31 @@ from scipy.ndimage import gaussian_filter, grey_dilation, grey_erosion, label as
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TactileIntent:
+    """High-level tactile design intent — controls preprocessing behaviour.
+
+    Attributes:
+        gamma:          Exponent applied to the normalised heightfield.
+                        <1 boosts low relief (soft), >1 emphasises peaks (rough).
+        edge_sigma:     Gaussian blur sigma (mm) for step-edge softening.
+        morph_strength: Multiplier on tool_radius for morphological opening.
+                        <1 = narrower grooves, >1 = wider grooves.
+        terrace_steps:  Number of discrete height levels.
+        physical_size_mm: Machining size in mm (100-200 typical).
+        target_resolution: Output resolution in pixels.
+    """
+    gamma: float = 1.0
+    edge_sigma: float = 1.5
+    morph_strength: float = 1.0
+    terrace_steps: int = 8
+    physical_size_mm: float = 150.0
+    target_resolution: int = 512
+
+
+@dataclass
 class MachiningFilterConfig:
     physical_size_mm: float = 50.0
-    max_height_mm: float = 5.0
+    max_height_mm: float = 20.0
     tool_radius_mm: float = 3.0        # 6 mm diameter ball-end mill → radius = 3 mm
     max_slope_deg: float = 30.0
     face_limit: int = 500_000
@@ -77,6 +99,279 @@ def normalize_heightfield(hf: np.ndarray) -> np.ndarray:
     hf = np.clip(hf, p_low, p_high)
     hf = (hf - p_low) / (p_high - p_low + 1e-8)
     return hf.astype(np.float32)
+
+
+def _remove_heightmap_bias(
+    hf: np.ndarray,
+    clip_limit: float = 2.0,
+    tile_grid_size: int = 8,
+) -> np.ndarray:
+    """
+    Remove large-scale illumination bias using CLAHE
+    (Contrast Limited Adaptive Histogram Equalization).
+
+    CLAHE divides the image into tiles and equalises each tile
+    independently, then blends boundaries. This suppresses
+    large-scale lighting gradients while preserving local texture
+    contrast at grain scale.
+
+    clip_limit     : contrast enhancement limit per tile [1.0-4.0]
+                     higher = more equalisation, 2.0 is conservative
+    tile_grid_size : number of tiles per axis [4-16]
+                     smaller tiles = more local correction
+                     8x8 works well for 256px heightmaps
+    """
+    hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+
+    # Convert to uint8 for CLAHE
+    hf_uint8 = (hf * 255).astype(np.uint8)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=(int(tile_grid_size), int(tile_grid_size)),
+    )
+    hf_eq = clahe.apply(hf_uint8)
+
+    # Back to float32 [0, 1]
+    return (hf_eq.astype(np.float32) / 255.0)
+
+
+def _enforce_grain_direction(
+    hf: np.ndarray,
+    grain_angle_deg: float,
+    along_blur_sigma: float = 20.0,
+    strength: float = 0.8,
+) -> np.ndarray:
+    """Force heightmap gradients to be perpendicular to grain direction.
+
+    For wood with vertical grain (grain_angle≈90°), height should vary
+    horizontally. This function:
+      1. Rotates the heightmap so grain is horizontal
+      2. Applies strong blur along the grain axis (vertical after rotation)
+         to average out height variation along grain lines
+      3. Rotates back
+      4. Blends with original to preserve some texture detail
+
+    grain_angle_deg : grain direction in degrees (90=vertical grain)
+    along_blur_sigma: blur sigma along grain direction (px).
+                      Should be large (15-30) to fully average grain lines.
+    strength        : blend weight [0,1].
+                      1.0 = fully direction-enforced (contours perpendicular to grain)
+                      0.7 = recommended (preserves some original texture)
+    """
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    H, W = hf.shape
+
+    # Rotate so grain becomes horizontal (rotate by -grain_angle)
+    center = (W / 2.0, H / 2.0)
+    rot_mat = cv2.getRotationMatrix2D(center, grain_angle_deg, 1.0)
+    rot_back = cv2.getRotationMatrix2D(center, -grain_angle_deg, 1.0)
+
+    hf_rotated = cv2.warpAffine(
+        hf, rot_mat, (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+
+    # Strong blur along grain (now horizontal = X direction after rotation)
+    # Use separable blur: large sigma in X, tiny sigma in Y
+    hf_blurred = _gf1d(hf_rotated, sigma=along_blur_sigma, axis=1)  # axis=1 = X = along grain
+    hf_blurred = _gf1d(hf_blurred, sigma=0.5,              axis=0)  # axis=0 = Y = across grain (minimal)
+
+    # Rotate back
+    hf_directional = cv2.warpAffine(
+        hf_blurred, rot_back, (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+
+    # Renormalise to [0,1]
+    lo, hi = float(hf_directional.min()), float(hf_directional.max())
+    if hi - lo > 1e-7:
+        hf_directional = (hf_directional - lo) / (hi - lo)
+
+    # Blend: strength=1 → pure directional, strength=0 → original
+    hf_out = (1.0 - strength) * hf + strength * hf_directional
+    lo, hi = float(hf_out.min()), float(hf_out.max())
+    if hi - lo > 1e-7:
+        hf_out = (hf_out - lo) / (hi - lo)
+
+    return hf_out.astype(np.float32)
+
+
+def _estimate_grain_period(
+    image_gray: np.ndarray,
+    grain_angle_deg: float,
+    coherence: np.ndarray | None = None,
+    sigma_integration: float = 2.0,
+    n_strips: int = 8,
+) -> list[float]:
+    """
+    Estimate all significant grain periods using coherence-weighted
+    multi-strip FFT sampling.
+
+    Generic approach — works for any wood image:
+      1. Sample strips preferentially from high-coherence regions
+         (clear grain, no knots) using coherence map as weight.
+      2. Run FFT on each strip to find dominant frequencies.
+      3. Collect ALL significant peaks (not just the top one)
+         to detect both fine and coarse grain patterns.
+      4. Return list of significant periods sorted fine→coarse.
+
+    Returns:
+        List of significant periods in pixels [3, 60], sorted ascending.
+        Caller decides how many to use.
+    """
+    H, W = image_gray.shape
+    perp_angle_rad = np.radians(grain_angle_deg - 90.0)
+
+    # Build coherence-based sampling weight map
+    if coherence is not None and coherence.shape == (H, W):
+        weight_map = coherence.astype(np.float32)
+    else:
+        weight_map = np.ones((H, W), dtype=np.float32)
+
+    # Sample strip centres weighted by coherence
+    weight_flat = weight_map.flatten()
+    weight_sum = weight_flat.sum()
+    if weight_sum < 1e-6:
+        weight_flat = np.ones_like(weight_flat)
+        weight_sum = weight_flat.sum()
+    prob = weight_flat / weight_sum
+
+    rng = np.random.default_rng(seed=42)  # deterministic
+    flat_indices = rng.choice(len(prob), size=n_strips, replace=False, p=prob)
+    centres_y = flat_indices // W
+    centres_x = flat_indices % W
+
+    # Collect FFT magnitude spectra from all strips
+    strip_len = min(H, W) // 2
+    freqs = np.fft.rfftfreq(strip_len)
+    accumulated_fft = np.zeros(len(freqs), dtype=np.float32)
+
+    valid_strips = 0
+    for cx, cy in zip(centres_x, centres_y):
+        t = np.arange(-strip_len // 2, strip_len // 2, dtype=np.float32)
+        sample_x = np.clip(cx + t * np.cos(perp_angle_rad), 0, W - 1)
+        sample_y = np.clip(cy + t * np.sin(perp_angle_rad), 0, H - 1)
+
+        profile = cv2.remap(
+            image_gray.astype(np.float32),
+            sample_x.reshape(1, -1).astype(np.float32),
+            sample_y.reshape(1, -1).astype(np.float32),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        ).flatten()
+
+        from scipy.ndimage import gaussian_filter1d as _gf1d
+        profile = _gf1d(profile, sigma=sigma_integration)
+        profile -= profile.mean()
+        if np.abs(profile).max() < 1e-6:
+            continue
+
+        fft_mag = np.abs(np.fft.rfft(profile))
+        fft_max = fft_mag.max()
+        if fft_max > 1e-6:
+            accumulated_fft += fft_mag / fft_max
+            valid_strips += 1
+
+    if valid_strips == 0:
+        print(f"  [period] no valid strips, fallback period=[8.0]")
+        return [8.0]
+
+    accumulated_fft /= valid_strips
+
+    # Suppress DC and sub-3px frequencies
+    min_period_px = 3.0
+    max_period_px = 60.0
+    for i, f in enumerate(freqs):
+        if f < 1e-6:
+            accumulated_fft[i] = 0
+            continue
+        period = 1.0 / f
+        if period < min_period_px or period > max_period_px:
+            accumulated_fft[i] = 0
+
+    if accumulated_fft.max() < 1e-6:
+        print(f"  [period] FFT empty after filtering, fallback=[8.0]")
+        return [8.0]
+
+    # Find ALL significant peaks (not just the top one)
+    from scipy.signal import find_peaks as _find_peaks
+    threshold = accumulated_fft.max() * 0.30
+    peak_indices, _ = _find_peaks(
+        accumulated_fft,
+        height=threshold,
+        distance=3,
+    )
+
+    if len(peak_indices) == 0:
+        peak_indices = [int(np.argmax(accumulated_fft))]
+
+    # Convert peak indices to periods
+    periods = []
+    for idx in peak_indices:
+        f = freqs[idx]
+        if f > 1e-6:
+            p = float(np.clip(1.0 / f, min_period_px, max_period_px))
+            periods.append(p)
+
+    periods = sorted(set(round(p, 1) for p in periods))
+
+    print(f"  [period] valid strips: {valid_strips}/{n_strips}")
+    print(f"  [period] detected periods: {periods}px")
+    return periods if periods else [8.0]
+
+
+def _apply_grain_periodicity(
+    hf: np.ndarray,
+    grain_angle_deg: float,
+    periods_px: list[float],
+    n_steps_per_period: int = 3,
+    total_steps: int = 12,
+    strength: float = 0.6,
+) -> np.ndarray:
+    """
+    Superimpose sawtooth waves for ALL detected grain periods.
+
+    Fine periods get higher weight (more visible) than coarse ones,
+    since they correspond to the dominant grain texture. Coarse periods
+    (e.g. growth ring spacing) get lower weight as secondary structure.
+    """
+    H, W = hf.shape
+    perp_angle_rad = np.radians(grain_angle_deg - 90.0)
+    xs = np.arange(W, dtype=np.float32)
+    ys = np.arange(H, dtype=np.float32)
+    X, Y = np.meshgrid(xs, ys)
+    proj = X * np.cos(perp_angle_rad) + Y * np.sin(perp_angle_rad)
+
+    amplitude_per_step = 1.0 / float(max(total_steps - 1, 1))
+
+    # Build combined wave: fine periods get more weight
+    combined_wave = np.zeros((H, W), dtype=np.float32)
+    total_weight = 0.0
+
+    for period in periods_px:
+        w = 1.0 / period
+        sawtooth = (proj % period) / period   # [0, 1] sawtooth
+        amp = float(n_steps_per_period) * amplitude_per_step
+        combined_wave += w * amp * sawtooth
+        total_weight += w
+
+    if total_weight > 1e-6:
+        combined_wave /= total_weight
+
+    # Clip combined wave to reasonable amplitude
+    combined_wave = np.clip(combined_wave, 0.0, 1.0)
+
+    # Blend with original heightmap
+    hf_out = hf * (1.0 - strength) + (hf + combined_wave) * strength
+
+    lo, hi = float(hf_out.min()), float(hf_out.max())
+    if hi - lo > 1e-7:
+        hf_out = (hf_out - lo) / (hi - lo)
+
+    return hf_out.astype(np.float32)
 
 
 def remove_global_trend(hf: np.ndarray, sigma_px: float = 150.0) -> np.ndarray:
@@ -237,7 +532,10 @@ def suppress_narrow_recesses(
     processing and restored from the original after opening.
     """
     H, W = heightfield.shape
-    r = max(int(math.ceil(tool_radius_px)), 1)
+    # Minimum r=2 to have any effect; if radius < 1.5px skip entirely
+    if tool_radius_px < 1.5:
+        return heightfield.copy()
+    r = max(int(math.ceil(tool_radius_px)), 2)
     short_axis = max(r // 4, 1)  # 8px when r=16 (tool_radius_px≈16)
 
     inv = (1.0 - heightfield).astype(np.float32)
@@ -403,6 +701,7 @@ def filter_heightfield_for_machining(
     config: MachiningFilterConfig | None = None,
     orientation_map: np.ndarray | None = None,
     source_image: np.ndarray | None = None,
+    intent: TactileIntent | None = None,
 ) -> tuple[np.ndarray, MachiningFilterReport]:
     """
     Apply all machining constraints to a heightfield in a deterministic sequence:
@@ -431,6 +730,12 @@ def filter_heightfield_for_machining(
 
     report.input_shape = (heightfield.shape[0], heightfield.shape[1])
     hf = normalize_heightfield(heightfield)
+
+    # Step 1b: Gamma correction (TactileIntent)
+    if intent is not None and intent.gamma != 1.0:
+        hf = np.power(np.clip(hf, 0.0, 1.0), intent.gamma)
+        hf = hf / (hf.max() + 1e-8) if hf.max() > 0 else hf
+        hf = hf.astype(np.float32)
 
     # Step 2: Resolution targeting
     current_res = hf.shape[0]
@@ -461,7 +766,10 @@ def filter_heightfield_for_machining(
     report.max_slope_deg_before = float(slope_before_map.max())
 
     # Step 3.5: Resolve terrace step count
-    if config.terrace_steps == 0:
+    # TactileIntent.terrace_steps takes highest priority
+    if intent is not None:
+        actual_terrace_steps = intent.terrace_steps
+    elif config.terrace_steps == 0:
         tool_diameter_mm = config.tool_radius_mm * 2.0
         actual_terrace_steps = max(
             2,
@@ -480,8 +788,13 @@ def filter_heightfield_for_machining(
 
     # Step 4: Suppress sub-tool-diameter recesses (anisotropic if orientation provided)
     tool_radius_px = config.tool_radius_mm / pixel_size_mm
-    report.morph_radius_px = tool_radius_px
-    hf = suppress_narrow_recesses(hf, tool_radius_px,
+    # TactileIntent.morph_strength scales the effective tool radius
+    if intent is not None:
+        effective_radius = tool_radius_px * intent.morph_strength
+    else:
+        effective_radius = tool_radius_px
+    report.morph_radius_px = effective_radius
+    hf = suppress_narrow_recesses(hf, effective_radius,
                                   orientation_map=orientation_map,
                                   mask=knot_mask)
     hf = np.clip(hf, 0.0, 1.0)
@@ -500,11 +813,10 @@ def filter_heightfield_for_machining(
         )
     else:
         # Step 5: Gaussian smoothing
-        sigma_px = (
-            config.gaussian_sigma_px
-            if config.gaussian_sigma_px > 0.0
-            else max(config.tool_radius_mm / pixel_size_mm, 1.0)
-        )
+        if config.gaussian_sigma_px > 0.0:
+            sigma_px = config.gaussian_sigma_px
+        else:
+            sigma_px = max(config.tool_radius_mm / pixel_size_mm, 1.0)
         report.smoothing_sigma_px = sigma_px
         hf = smooth_by_tool_scale(
             hf, config.tool_radius_mm, pixel_size_mm,
@@ -513,8 +825,11 @@ def filter_heightfield_for_machining(
         )
         hf = np.clip(hf, 0.0, 1.0)
 
-        # Step 5b: Terracing with slope-calibrated riser sigma
-        if actual_terrace_steps > 1 and config.max_height_mm > 0 and config.max_slope_deg > 0:
+        # Step 5b: Terracing with riser edge softening
+        # TactileIntent.edge_sigma (mm) → convert to pixels
+        if intent is not None:
+            riser_sigma_px = max(intent.edge_sigma / pixel_size_mm, 1.0)
+        elif actual_terrace_steps > 1 and config.max_height_mm > 0 and config.max_slope_deg > 0:
             step_height_mm = config.max_height_mm / (actual_terrace_steps - 1)
             riser_sigma_px = max(
                 step_height_mm / (
@@ -606,9 +921,9 @@ def save_report_json(report: MachiningFilterReport, out_path: str | Path) -> Non
 @dataclass
 class TerraceConfig:
     physical_size_mm: float = 50.0
-    max_height_mm: float = 5.0
-    base_thickness_mm: float = 2.0
-    terrace_steps: int = 5          # number of discrete height levels
+    max_height_mm: float = 20.0
+    base_thickness_mm: float = 3.0
+    terrace_steps: int = 12         # number of discrete height levels
     tool_diameter_mm: float = 6.0   # 6 mm ball-end mill — primary hard rule
     mesh_resolution: int = 256      # resize heightfield to this before building mesh
     face_limit: int = 500_000       # warn if exceeded after build
@@ -632,6 +947,38 @@ def _quantize(heightfield: np.ndarray, n_levels: int) -> np.ndarray:
     clipped = np.clip(heightfield, 0.0, 1.0)
     labels = np.floor(clipped * n_levels).astype(np.int32)
     return np.clip(labels, 0, n_levels - 1)
+
+
+def _smooth_contour_edges(
+    labels: np.ndarray,
+    n_levels: int,
+    radius_px: int = 2,
+) -> np.ndarray:
+    """
+    Remove spike artifacts from quantised contour edges.
+
+    For each level, applies morphological closing to the binary mask
+    (labels == level), which rounds jagged boundaries without
+    changing the overall step topology.
+
+    radius_px=2 removes spikes up to 4px wide (~2.3mm at 150mm/256px).
+    Safe upper limit is tool_radius_px (~5px).
+    """
+    result = labels.copy()
+    r = max(int(radius_px), 1)
+    yi, xi = np.ogrid[-r: r + 1, -r: r + 1]
+    disk = (xi ** 2 + yi ** 2 <= r ** 2).astype(np.uint8)
+
+    for level in range(n_levels):
+        mask = (labels == level).astype(np.uint8)
+        if mask.sum() == 0:
+            continue
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, disk)
+        promote = (closed == 1) & (result < level)
+        result[promote] = level
+
+    return result
+
 
 def _resolve_checkerboard(labels: np.ndarray) -> np.ndarray:
     """
@@ -705,12 +1052,145 @@ def _z_of_label(
     return label / (n_levels - 1) * max_height_mm + base_mm
 
 # ---------------------------------------------------------------------------
+# Intent-driven preprocessing (simplified pipeline for MLP integration)
+# ---------------------------------------------------------------------------
+
+def preprocess_for_terrace(
+    heightfield: np.ndarray,
+    tool_diameter_mm: float = 6.0,
+    physical_size_mm: float = 150.0,
+    target_resolution: int = 512,
+    intent: TactileIntent | None = None,
+    image_gray: np.ndarray | None = None,
+    grain_strength: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Simplified preprocessing pipeline driven by TactileIntent.
+
+    Steps: normalize → debias → resize → gamma → morph → edge blur → anti-spike.
+    Returns (heightfield [0,1] float32, image_gray resized or None).
+    Grain smoothing is deferred to the mesh builder (label-level).
+    """
+    if intent is None:
+        intent = TactileIntent()
+
+    # Intent overrides function args when provided
+    physical_size_mm = intent.physical_size_mm
+    target_resolution = intent.target_resolution
+
+    hf = normalize_heightfield(heightfield)
+
+    # Remove large-scale illumination bias from heightmap
+    hf = _remove_heightmap_bias(hf, clip_limit=2.0, tile_grid_size=8)
+
+    # 临时debug
+    cv2.imwrite("debug_hf_clahe.png", (hf * 255).astype(np.uint8))
+    print(f"  [clahe] std={hf.std():.4f} min={hf.min():.3f} max={hf.max():.3f}")
+
+    # Enforce grain direction: blur along grain, keep variation across grain
+    if image_gray is not None and grain_strength > 0.0:
+        from grain_modulation import compute_grain_angle, remove_illumination
+        image_clean = remove_illumination(
+            cv2.resize(image_gray.astype(np.float32), (hf.shape[1], hf.shape[0]),
+                       interpolation=cv2.INTER_AREA),
+            sigma_illumination=32.0,
+        )
+        grain_angle, coherence = compute_grain_angle(image_clean)
+        mean_angle_deg = float(
+            np.degrees(grain_angle[coherence > 0.3].mean())
+        ) if (coherence > 0.3).any() else 90.0
+
+        print(f"  [direction] enforcing grain at {mean_angle_deg:.1f}deg")
+
+        # Map grain_strength [0,20] -> along_blur_sigma [0,25], strength [0,1]
+        along_sigma = float(grain_strength) * 1.25
+        blend = float(np.clip(grain_strength / 20.0, 0.0, 1.0))
+
+        hf = _enforce_grain_direction(
+            hf,
+            grain_angle_deg=mean_angle_deg,
+            along_blur_sigma=along_sigma,
+            strength=blend,
+        )
+        hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+
+        # 临时debug
+        cv2.imwrite("debug_hf_directional.png", (hf * 255).astype(np.uint8))
+        print(f"  [direction] std={hf.std():.4f}")
+
+        # Multi-scale period detection using coherence-weighted sampling
+        periods_px = _estimate_grain_period(
+            cv2.resize(image_clean, (hf.shape[1], hf.shape[0]),
+                       interpolation=cv2.INTER_AREA),
+            grain_angle_deg=mean_angle_deg,
+            coherence=cv2.resize(coherence, (hf.shape[1], hf.shape[0]),
+                                  interpolation=cv2.INTER_AREA),
+            n_strips=8,
+        )
+
+        hf = _apply_grain_periodicity(
+            hf,
+            grain_angle_deg=mean_angle_deg,
+            periods_px=periods_px,
+            n_steps_per_period=3,
+            total_steps=intent.terrace_steps,
+            strength=0.6,
+        )
+        hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+
+        cv2.imwrite("debug_hf_periodic.png", (hf * 255).astype(np.uint8))
+        print(f"  [period] sawtooth applied: periods={periods_px} "
+              f"n_steps={3} amplitude={3/(intent.terrace_steps-1):.3f}")
+
+    if hf.shape[0] != target_resolution or hf.shape[1] != target_resolution:
+        hf = cv2.resize(hf, (target_resolution, target_resolution),
+                        interpolation=cv2.INTER_AREA)
+
+    px_size = physical_size_mm / (target_resolution - 1)
+    tool_radius_mm = tool_diameter_mm / 2.0
+    tool_radius_px = tool_radius_mm / px_size
+
+    # Resize image_gray to match heightfield (for later grain analysis)
+    gray_out = None
+    if image_gray is not None:
+        gray_out = image_gray.astype(np.float32)
+        if gray_out.shape[0] != target_resolution or gray_out.shape[1] != target_resolution:
+            gray_out = cv2.resize(gray_out,
+                                  (target_resolution, target_resolution),
+                                  interpolation=cv2.INTER_AREA)
+
+    # Step 1: gamma height remapping
+    # Clamp gamma to safe range — values < 0.85 compress dynamic range
+    # into high end causing step features to flatten out
+    gamma_safe = float(np.clip(intent.gamma, 0.85, 1.8))
+    hf = np.power(np.clip(hf, 0.0, 1.0), gamma_safe).astype(np.float32)
+
+    # Step 2: morphological opening
+    # Skip if morph_strength <= 0.5 to preserve fine rough texture
+    if intent.morph_strength > 0.5:
+        effective_radius_px = tool_radius_px * intent.morph_strength
+        max_radius_px = target_resolution * 0.05
+        effective_radius_px = min(effective_radius_px, max_radius_px)
+        hf = suppress_narrow_recesses(hf, effective_radius_px)
+
+    # Step 3: edge_sigma
+    edge_sigma_px = np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0])
+    hf = gaussian_filter(hf.astype(np.float32), sigma=edge_sigma_px)
+
+    # Final anti-spike pass
+    hf = gaussian_filter(hf, sigma=1.5)
+
+    return np.clip(hf, 0.0, 1.0).astype(np.float32), gray_out
+
+
+# ---------------------------------------------------------------------------
 # Mesh builder
 # ---------------------------------------------------------------------------
 
 def heightfield_to_terrace_mesh(
     heightfield: np.ndarray,
     config: TerraceConfig | None = None,
+    grain_image: np.ndarray | None = None,
+    grain_along_sigma: float = 8.0,
 ) -> tuple[trimesh.Trimesh, TerraceReport]:
     """
     Build a watertight stepped-terrace mesh from a [0, 1] float heightfield.
@@ -744,6 +1224,20 @@ def heightfield_to_terrace_mesh(
 
     # Step 1: Sharp quantisation — no blur.
     labels = _quantize(heightfield, n)
+
+    # Step 1.5: Smooth contour edges to remove spike artifacts
+    labels = _smooth_contour_edges(labels, n, radius_px=3)
+
+    # Step 1.6: Anisotropic grain-guided contour smoothing (optional)
+    if grain_image is not None:
+        from grain_modulation import smooth_labels_by_grain
+        labels = smooth_labels_by_grain(
+            labels,
+            grain_image,
+            n_levels=n,
+            along_sigma=grain_along_sigma,
+            across_sigma=0.5,
+        )
 
     # Step 2: Enforce minimum recess width (6 mm hard rule).
     labels = _enforce_min_recess_width(labels, tool_radius_px, n)
@@ -1087,7 +1581,7 @@ def compute_machinability_weight(
     heightfield: np.ndarray,
     physical_size_mm: float,
     tool_diameter_mm: float,
-    max_height_mm: float = 5.0,
+    max_height_mm: float = 20.0,
     config: SaliencyConfig | None = None,
 ) -> tuple[np.ndarray, SaliencyReport]:
     """
