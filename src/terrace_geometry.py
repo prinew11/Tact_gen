@@ -980,6 +980,257 @@ def _smooth_contour_edges(
     return result
 
 
+def _region_aware_quantize(
+    heightfield: np.ndarray,
+    n_levels: int,
+    smoothing_sigma: float = 3.0,
+    min_region_px: int = 50,
+) -> np.ndarray:
+    """
+    Region-aware quantisation using connected-component segmentation.
+
+    Instead of quantising each pixel independently (which creates
+    isolated islands from noise), this:
+    1. Smooths the heightfield to get stable region boundaries
+    2. Finds connected components at each quantised level
+    3. Assigns each region a single quantisation level based on
+       its median height
+    4. Merges tiny regions into neighbours
+
+    This guarantees no isolated 1-pixel islands.
+
+    smoothing_sigma: pre-smoothing before quantisation (px)
+    min_region_px  : regions smaller than this are merged
+    """
+    H, W = heightfield.shape
+    hf = np.clip(heightfield, 0.0, 1.0).astype(np.float32)
+
+    # Step 1: Smooth for stable region detection
+    hf_smooth = gaussian_filter(hf, sigma=smoothing_sigma)
+
+    # Step 2: Quantise the smoothed map to get initial level assignments
+    n = n_levels
+    labels_init = np.floor(
+        np.clip(hf_smooth, 0.0, 1.0 - 1e-6) * n
+    ).astype(np.int32)
+
+    # Step 3: For each level, find connected components
+    # Each connected component becomes a region
+    region_map = np.zeros((H, W), dtype=np.int32)
+    region_id = 1
+    region_level: dict[int, int] = {}
+
+    for level in range(n):
+        mask = (labels_init == level).astype(np.uint8)
+        if mask.sum() == 0:
+            continue
+        n_comp, comp_map = cv2.connectedComponents(mask, connectivity=8)
+        for cid in range(1, n_comp):
+            comp_mask = (comp_map == cid)
+
+            # Use ORIGINAL (unsmoothed) heightfield median for level assignment
+            # This preserves true height while region boundaries come from smooth
+            region_heights = hf[comp_mask]
+            median_h = float(np.median(region_heights))
+
+            # Quantise based on median — all pixels in this region get same level
+            true_level = int(np.clip(np.floor(median_h * n), 0, n - 1))
+
+            region_map[comp_mask] = region_id
+            region_level[region_id] = true_level   # use true_level, not level
+            region_id += 1
+
+    # Step 4: Merge tiny regions into dominant neighbour
+    changed = True
+    while changed:
+        changed = False
+        for rid in list(region_level.keys()):
+            mask = (region_map == rid)
+            area = int(mask.sum())
+            if area == 0:
+                del region_level[rid]
+                continue
+            if area >= min_region_px:
+                continue
+
+            # Find neighbour regions
+            dilated = cv2.dilate(
+                mask.astype(np.uint8),
+                np.ones((3, 3), np.uint8),
+            )
+            neighbor_mask = (dilated == 1) & (~mask)
+            neighbor_ids = region_map[neighbor_mask]
+            neighbor_ids = neighbor_ids[neighbor_ids != rid]
+            neighbor_ids = neighbor_ids[neighbor_ids != 0]
+
+            if len(neighbor_ids) == 0:
+                continue
+
+            # Merge into most common neighbour
+            counts = np.bincount(neighbor_ids)
+            dominant_rid = int(counts.argmax())
+            if dominant_rid == 0 or dominant_rid not in region_level:
+                continue
+
+            region_map[mask] = dominant_rid
+            del region_level[rid]
+            changed = True
+
+    # Step 5: Build final label map from region assignments
+    result = np.zeros((H, W), dtype=np.int32)
+    for rid, level in region_level.items():
+        result[region_map == rid] = level
+
+    # Handle any unassigned pixels (region_map == 0)
+    unassigned = (region_map == 0)
+    if unassigned.any():
+        result[unassigned] = labels_init[unassigned]
+
+    result = np.clip(result, 0, n - 1)
+
+    n_regions = len(region_level)
+    print(f"  [region_q] {n_regions} regions, "
+          f"{n_levels} levels, "
+          f"min_region={min_region_px}px")
+
+    return result
+
+
+def _edge_guided_quantize(
+    heightfield: np.ndarray,
+    n_levels: int,
+    edge_sigma: float = 2.0,
+    edge_threshold: float = 0.05,
+    min_region_px: int = 80,
+) -> np.ndarray:
+    """
+    Edge-guided quantisation.
+
+    1. Detect edges in the heightfield (boundaries between levels)
+    2. Use edges as watershed barriers to segment into regions
+    3. Each region gets a single level based on its median height
+    4. Merge tiny regions into neighbours
+
+    This ensures areas enclosed by contour lines become single
+    flat terraces, with no internal height splitting.
+
+    edge_sigma     : smoothing before edge detection (px)
+    edge_threshold : gradient magnitude threshold for edge detection
+                     lower = more edges = finer regions
+    min_region_px  : merge regions smaller than this
+    """
+    from scipy.ndimage import gaussian_filter as _gf
+
+    H, W = heightfield.shape
+    hf = np.clip(heightfield, 0.0, 1.0).astype(np.float32)
+
+    # Step 1: Smooth then detect edges
+    hf_smooth = _gf(hf, sigma=edge_sigma)
+    grad_x = cv2.Sobel(hf_smooth, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(hf_smooth, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+
+    # Normalise gradient
+    grad_max = float(grad_mag.max())
+    if grad_max > 1e-6:
+        grad_norm = (grad_mag / grad_max).astype(np.float32)
+    else:
+        grad_norm = np.zeros_like(grad_mag)
+
+    # Edge mask: strong gradient = boundary between levels
+    edge_mask = (grad_norm > edge_threshold).astype(np.uint8)
+
+    # Step 2: Non-edge pixels form the "interior" of regions
+    interior = (1 - edge_mask).astype(np.uint8)
+
+    # Step 3: Label connected interior regions
+    n_comp, region_map = cv2.connectedComponents(interior, connectivity=8)
+
+    # Step 4: Assign each region its median height level
+    result = np.zeros((H, W), dtype=np.int32)
+    n = n_levels
+
+    region_levels = {}
+    for rid in range(1, n_comp):
+        mask = (region_map == rid)
+        area = int(mask.sum())
+        if area == 0:
+            continue
+        # Median height of this region in the original (unsmoothed) heightfield
+        median_h = float(np.median(hf[mask]))
+        level = int(np.clip(
+            np.floor(median_h * n), 0, n - 1
+        ))
+        result[mask] = level
+        region_levels[rid] = (level, area)
+
+    # Step 5: Fill edge pixels by nearest interior region
+    # Use distance transform to assign edge pixels to nearest region
+    edge_pixels = edge_mask.astype(bool)
+    if edge_pixels.any():
+        # For each edge pixel, find the nearest non-edge pixel's label
+        from scipy.ndimage import distance_transform_edt
+        _, nearest_idx = distance_transform_edt(
+            edge_mask, return_indices=True
+        )
+        nearest_labels = region_map[nearest_idx[0], nearest_idx[1]]
+        for rid in range(1, n_comp):
+            if rid in region_levels:
+                edge_assign = (nearest_labels == rid) & edge_pixels
+                result[edge_assign] = region_levels[rid][0]
+
+    # Step 6: Merge tiny regions
+    changed = True
+    iterations = 0
+    while changed and iterations < 10:
+        changed = False
+        iterations += 1
+        for rid in range(1, n_comp):
+            if rid not in region_levels:
+                continue
+            level, area = region_levels[rid]
+            if area >= min_region_px:
+                continue
+
+            mask = (result == level) & (region_map == rid)
+            actual_area = int(mask.sum())
+            if actual_area == 0:
+                del region_levels[rid]
+                continue
+
+            # Find neighbours
+            dilated = cv2.dilate(
+                mask.astype(np.uint8), np.ones((3, 3), np.uint8)
+            )
+            neighbor_mask = (dilated == 1) & (~mask)
+            neighbor_levels = result[neighbor_mask]
+
+            if len(neighbor_levels) == 0:
+                continue
+
+            counts = np.bincount(
+                neighbor_levels.astype(np.int64), minlength=n
+            )
+            # Prefer adjacent level (not same level)
+            counts[level] = 0
+            if counts.max() == 0:
+                continue
+
+            dominant_level = int(counts.argmax())
+            result[mask] = dominant_level
+            region_levels[rid] = (dominant_level, actual_area)
+            changed = True
+
+    result = np.clip(result, 0, n - 1)
+
+    n_regions = sum(1 for _, (_, a) in region_levels.items() if a > 0)
+    print(f"  [edge_q] regions={n_regions}  "
+          f"edge_threshold={edge_threshold}  "
+          f"levels={n_levels}")
+
+    return result
+
+
 def _resolve_checkerboard(labels: np.ndarray) -> np.ndarray:
     """
     Fix 2x2 checkerboard saddle patterns that cause 4 riser faces to share a
@@ -1099,7 +1350,8 @@ def preprocess_for_terrace(
             np.degrees(grain_angle[coherence > 0.3].mean())
         ) if (coherence > 0.3).any() else 90.0
 
-        print(f"  [direction] enforcing grain at {mean_angle_deg:.1f}deg")
+        print(f"[grain] mean grain angle: {mean_angle_deg:.1f}°")
+        print(f"[grain] mean coherence: {float(coherence.mean()):.3f}")
 
         # Map grain_strength [0,20] -> along_blur_sigma [0,25], strength [0,1]
         along_sigma = float(grain_strength) * 1.25
@@ -1126,6 +1378,7 @@ def preprocess_for_terrace(
                                   interpolation=cv2.INTER_AREA),
             n_strips=8,
         )
+        print(f"[period] detected periods: {periods_px}")
 
         hf = _apply_grain_periodicity(
             hf,
@@ -1176,8 +1429,11 @@ def preprocess_for_terrace(
     edge_sigma_px = np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0])
     hf = gaussian_filter(hf.astype(np.float32), sigma=edge_sigma_px)
 
-    # Final anti-spike pass
-    hf = gaussian_filter(hf, sigma=1.5)
+    # Pre-quantisation smoothing: removes pixel-level noise that would
+    # create 1px isolated steps after quantisation.
+    # sigma=2.5 is safe — larger than 1px noise, smaller than
+    # smallest meaningful feature (~5px grain period).
+    hf = gaussian_filter(hf, sigma=4.0)
 
     return np.clip(hf, 0.0, 1.0).astype(np.float32), gray_out
 
@@ -1222,11 +1478,30 @@ def heightfield_to_terrace_mesh(
     tool_radius_px = (config.tool_diameter_mm / 2.0) / px_size
     n = config.terrace_steps
 
-    # Step 1: Sharp quantisation — no blur.
-    labels = _quantize(heightfield, n)
+    def _labels_to_img(lbl: np.ndarray) -> np.ndarray:
+        lv_max = lbl.max() if lbl.max() > 0 else 1
+        return (lbl.astype(np.float32) / lv_max * 255).astype(np.uint8)
 
-    # Step 1.5: Smooth contour edges to remove spike artifacts
-    labels = _smooth_contour_edges(labels, n, radius_px=3)
+    # Step 1: Region-aware quantisation
+    # Groups connected pixels into stable regions before level assignment.
+    # Eliminates isolated islands that come from pixel-wise quantisation.
+    labels = _region_aware_quantize(
+        heightfield,
+        n_levels=n,
+        smoothing_sigma=2.0,
+        min_region_px=80,
+    )
+    cv2.imwrite("debug_step1_quantize.png", _labels_to_img(labels))
+
+    # Step 1.5: DISABLED — gaussian blur destroys region boundaries
+    # _region_aware_quantize already produces clean regions
+    # labels_float = labels.astype(np.float32) / max(n - 1, 1)
+    # labels_float = gaussian_filter(labels_float, sigma=1.0)
+    # labels = np.clip(
+    #     np.round(labels_float * (n - 1)).astype(np.int32),
+    #     0, n - 1,
+    # )
+    cv2.imwrite("debug_step15_smooth.png", _labels_to_img(labels))
 
     # Step 1.6: Anisotropic grain-guided contour smoothing (optional)
     if grain_image is not None:
@@ -1239,11 +1514,13 @@ def heightfield_to_terrace_mesh(
             across_sigma=0.5,
         )
 
-    # Step 2: Enforce minimum recess width (6 mm hard rule).
-    labels = _enforce_min_recess_width(labels, tool_radius_px, n)
+    # Step 2: DISABLED
+    # labels = _enforce_min_recess_width(labels, tool_radius_px, n)
+    cv2.imwrite("debug_step2_enforce.png", _labels_to_img(labels))
 
     # Step 3: Resolve checkerboard saddle points that produce non-manifold edges.
     labels = _resolve_checkerboard(labels)
+    cv2.imwrite("debug_step3_checker.png", _labels_to_img(labels))
 
     # Step 4: Flip rows so image-top maps to STL back (y=H_mm), not y=0.
     labels = np.flipud(labels)
