@@ -1005,42 +1005,53 @@ def _region_aware_quantize(
     H, W = heightfield.shape
     hf = np.clip(heightfield, 0.0, 1.0).astype(np.float32)
 
-    # Step 1: Smooth for stable region detection
-    hf_smooth = gaussian_filter(hf, sigma=smoothing_sigma)
-
-    # Step 2: Quantise the smoothed map to get initial level assignments
+    # Step 1: Quantise ORIGINAL heightfield (preserves peaks and ridges)
     n = n_levels
     labels_init = np.floor(
+        np.clip(hf, 0.0, 1.0 - 1e-6) * n
+    ).astype(np.int32)
+
+    # Step 2: Smooth for CONNECTIVITY only (not for level assignment)
+    # Use smooth to decide which pixels are "connected" (same region)
+    # but keep the original quantised levels
+    hf_smooth = gaussian_filter(hf, sigma=smoothing_sigma)
+    labels_smooth = np.floor(
         np.clip(hf_smooth, 0.0, 1.0 - 1e-6) * n
     ).astype(np.int32)
 
-    # Step 3: For each level, find connected components
-    # Each connected component becomes a region
+    # Step 3: Find connected components on SMOOTHED labels
+    # (smoothed has fewer isolated pixels = cleaner regions)
     region_map = np.zeros((H, W), dtype=np.int32)
     region_id = 1
     region_level: dict[int, int] = {}
 
     for level in range(n):
-        mask = (labels_init == level).astype(np.uint8)
+        mask = (labels_smooth == level).astype(np.uint8)
         if mask.sum() == 0:
             continue
         n_comp, comp_map = cv2.connectedComponents(mask, connectivity=8)
         for cid in range(1, n_comp):
             comp_mask = (comp_map == cid)
-
-            # Use ORIGINAL (unsmoothed) heightfield median for level assignment
-            # This preserves true height while region boundaries come from smooth
-            region_heights = hf[comp_mask]
-            median_h = float(np.median(region_heights))
-
-            # Quantise based on median — all pixels in this region get same level
-            true_level = int(np.clip(np.floor(median_h * n), 0, n - 1))
-
             region_map[comp_mask] = region_id
-            region_level[region_id] = true_level   # use true_level, not level
+
+            # Level from ORIGINAL quantisation median (not smoothed)
+            orig_levels = labels_init[comp_mask]
+            true_level = int(np.median(orig_levels))
+            true_level = int(np.clip(true_level, 0, n - 1))
+
+            region_level[region_id] = true_level
             region_id += 1
 
-    # Step 4: Merge tiny regions into dominant neighbour
+    # Debug: state before merge
+    _dbg_before = np.zeros((H, W), dtype=np.int32)
+    for _rid, _lv in region_level.items():
+        _dbg_before[region_map == _rid] = _lv
+    _dbg_before = np.clip(_dbg_before, 0, n - 1)
+    _dbg_img = (_dbg_before.astype(np.float32) / max(n - 1, 1) * 255).astype(np.uint8)
+    cv2.imwrite("debug_region_before_merge.png", _dbg_img)
+    print(f"  [region_q] before merge: unique levels={len(np.unique(_dbg_before))}")
+
+    # Step 4: Merge tiny regions — prefer neighbour with closest level
     changed = True
     while changed:
         changed = False
@@ -1053,12 +1064,12 @@ def _region_aware_quantize(
             if area >= min_region_px:
                 continue
 
-            # Find neighbour regions
+            comp_mask = mask
             dilated = cv2.dilate(
-                mask.astype(np.uint8),
+                comp_mask.astype(np.uint8),
                 np.ones((3, 3), np.uint8),
             )
-            neighbor_mask = (dilated == 1) & (~mask)
+            neighbor_mask = (dilated == 1) & (~comp_mask)
             neighbor_ids = region_map[neighbor_mask]
             neighbor_ids = neighbor_ids[neighbor_ids != rid]
             neighbor_ids = neighbor_ids[neighbor_ids != 0]
@@ -1066,15 +1077,38 @@ def _region_aware_quantize(
             if len(neighbor_ids) == 0:
                 continue
 
-            # Merge into most common neighbour
-            counts = np.bincount(neighbor_ids)
-            dominant_rid = int(counts.argmax())
-            if dominant_rid == 0 or dominant_rid not in region_level:
+            current_level = region_level[rid]
+
+            # CHANGED: prefer neighbour with closest level, not most common
+            unique_neighbors = np.unique(neighbor_ids)
+            best_rid = None
+            best_level_diff = 999
+
+            for nid in unique_neighbors:
+                if nid not in region_level:
+                    continue
+                nlevel = region_level[nid]
+                diff = abs(nlevel - current_level)
+                if diff < best_level_diff:
+                    best_level_diff = diff
+                    best_rid = nid
+
+            if best_rid is None:
                 continue
 
-            region_map[mask] = dominant_rid
+            # Merge into best neighbour's region
+            region_map[comp_mask] = best_rid
             del region_level[rid]
             changed = True
+
+    # Debug: state after merge
+    _dbg_after = np.zeros((H, W), dtype=np.int32)
+    for _rid, _lv in region_level.items():
+        _dbg_after[region_map == _rid] = _lv
+    _dbg_after = np.clip(_dbg_after, 0, n - 1)
+    _dbg_img2 = (_dbg_after.astype(np.float32) / max(n - 1, 1) * 255).astype(np.uint8)
+    cv2.imwrite("debug_region_after_merge.png", _dbg_img2)
+    print(f"  [region_q] after merge:  unique levels={len(np.unique(_dbg_after))}")
 
     # Step 5: Build final label map from region assignments
     result = np.zeros((H, W), dtype=np.int32)
@@ -1330,15 +1364,12 @@ def preprocess_for_terrace(
 
     hf = normalize_heightfield(heightfield)
 
-    # Remove large-scale illumination bias from heightmap
-    hf = _remove_heightmap_bias(hf, clip_limit=2.0, tile_grid_size=8)
-
-    # 临时debug
-    cv2.imwrite("debug_hf_clahe.png", (hf * 255).astype(np.uint8))
-    print(f"  [clahe] std={hf.std():.4f} min={hf.min():.3f} max={hf.max():.3f}")
-
     # Enforce grain direction: blur along grain, keep variation across grain
     if image_gray is not None and grain_strength > 0.0:
+        # CLAHE only in grain mode — removes illumination bias before grain analysis
+        hf = _remove_heightmap_bias(hf, clip_limit=1.2, tile_grid_size=8)
+        cv2.imwrite("debug_hf_clahe.png", (hf * 255).astype(np.uint8))
+        print(f"  [clahe] std={hf.std():.4f} min={hf.min():.3f} max={hf.max():.3f}")
         from grain_modulation import compute_grain_angle, remove_illumination
         image_clean = remove_illumination(
             cv2.resize(image_gray.astype(np.float32), (hf.shape[1], hf.shape[0]),
@@ -1429,11 +1460,8 @@ def preprocess_for_terrace(
     edge_sigma_px = np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0])
     hf = gaussian_filter(hf.astype(np.float32), sigma=edge_sigma_px)
 
-    # Pre-quantisation smoothing: removes pixel-level noise that would
-    # create 1px isolated steps after quantisation.
-    # sigma=2.5 is safe — larger than 1px noise, smaller than
-    # smallest meaningful feature (~5px grain period).
-    hf = gaussian_filter(hf, sigma=4.0)
+    # Pre-quantisation smoothing removed —
+    # _region_aware_quantize(smoothing_sigma=2.0) handles noise internally.
 
     return np.clip(hf, 0.0, 1.0).astype(np.float32), gray_out
 
