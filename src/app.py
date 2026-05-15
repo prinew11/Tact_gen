@@ -584,10 +584,12 @@ def run_intent_generation(
     max_height: float,
     tool_radius: float,
     mesh_resolution: int,
-    grain_strength: float = 0.0,
+    grain_enabled: bool = False,
 ):
     """Full intent pipeline: image → heightmap → intent → terrace STL."""
     try:
+        # Convert checkbox to grain strength: True=20 (full), False=0 (off)
+        grain_strength = 20.0 if grain_enabled else 0.0
         from terrace_geometry import (
             TerraceConfig, TactileIntent,
             preprocess_for_terrace,
@@ -947,8 +949,8 @@ def build_app() -> gr.Blocks:
                 inp_int_tr = gr.Number(label="Tool radius (mm)", value=3.0)
                 inp_int_res = gr.Slider(64, 512, value=256, step=32,
                                          label="Mesh resolution")
-            inp_int_grain = gr.Slider(0.0, 20.0, value=0.0, step=1.0,
-                                       label="Grain warp strength (0=off, 8-12=recommended for dense parallel grain)")
+            inp_int_grain = gr.Checkbox(value=False,
+                                        label="Enable grain warp (dense parallel stripe patterns)")
             btn_int = gr.Button("Generate", variant="primary")
             with gr.Row():
                 out_int_hf = gr.Image(label="Stepped heightmap")

@@ -1364,12 +1364,11 @@ def preprocess_for_terrace(
 
     hf = normalize_heightfield(heightfield)
 
-    # Enforce grain direction: blur along grain, keep variation across grain
+    # Grain analysis (for period detection and label-layer smoothing)
+    # NO CLAHE, NO directional blur on heightmap — these destroy stripe patterns.
+    # Grain guidance is applied later at label level via smooth_labels_by_grain().
+    periods_px: list[float] = []
     if image_gray is not None and grain_strength > 0.0:
-        # CLAHE only in grain mode — removes illumination bias before grain analysis
-        hf = _remove_heightmap_bias(hf, clip_limit=1.2, tile_grid_size=8)
-        cv2.imwrite("debug_hf_clahe.png", (hf * 255).astype(np.uint8))
-        print(f"  [clahe] std={hf.std():.4f} min={hf.min():.3f} max={hf.max():.3f}")
         from grain_modulation import compute_grain_angle, remove_illumination
         image_clean = remove_illumination(
             cv2.resize(image_gray.astype(np.float32), (hf.shape[1], hf.shape[0]),
@@ -1384,22 +1383,6 @@ def preprocess_for_terrace(
         print(f"[grain] mean grain angle: {mean_angle_deg:.1f}°")
         print(f"[grain] mean coherence: {float(coherence.mean()):.3f}")
 
-        # Map grain_strength [0,20] -> along_blur_sigma [0,25], strength [0,1]
-        along_sigma = float(grain_strength) * 1.25
-        blend = float(np.clip(grain_strength / 20.0, 0.0, 1.0))
-
-        hf = _enforce_grain_direction(
-            hf,
-            grain_angle_deg=mean_angle_deg,
-            along_blur_sigma=along_sigma,
-            strength=blend,
-        )
-        hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
-
-        # 临时debug
-        cv2.imwrite("debug_hf_directional.png", (hf * 255).astype(np.uint8))
-        print(f"  [direction] std={hf.std():.4f}")
-
         # Multi-scale period detection using coherence-weighted sampling
         periods_px = _estimate_grain_period(
             cv2.resize(image_clean, (hf.shape[1], hf.shape[0]),
@@ -1411,6 +1394,7 @@ def preprocess_for_terrace(
         )
         print(f"[period] detected periods: {periods_px}")
 
+        # Apply sawtooth modulation to create sub-step grain texture
         hf = _apply_grain_periodicity(
             hf,
             grain_angle_deg=mean_angle_deg,
@@ -1450,11 +1434,18 @@ def preprocess_for_terrace(
 
     # Step 2: morphological opening
     # Skip if morph_strength <= 0.5 to preserve fine rough texture
+    # Skip if dense stripe pattern detected (period < 2x tool diameter)
     if intent.morph_strength > 0.5:
-        effective_radius_px = tool_radius_px * intent.morph_strength
-        max_radius_px = target_resolution * 0.05
-        effective_radius_px = min(effective_radius_px, max_radius_px)
-        hf = suppress_narrow_recesses(hf, effective_radius_px)
+        # Stripe protection: dense stripes would be flattened by opening
+        stripe_period = periods_px[0] if periods_px else 999
+        if stripe_period < tool_radius_px * 4:  # period < 2x tool diameter
+            print(f"  [morph] skipped — stripe period {stripe_period:.0f}px "
+                  f"< 2x tool diameter {tool_radius_px*2:.0f}px")
+        else:
+            effective_radius_px = tool_radius_px * intent.morph_strength
+            max_radius_px = target_resolution * 0.05
+            effective_radius_px = min(effective_radius_px, max_radius_px)
+            hf = suppress_narrow_recesses(hf, effective_radius_px)
 
     # Step 3: edge_sigma
     edge_sigma_px = np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0])
@@ -1513,11 +1504,12 @@ def heightfield_to_terrace_mesh(
     # Step 1: Region-aware quantisation
     # Groups connected pixels into stable regions before level assignment.
     # Eliminates isolated islands that come from pixel-wise quantisation.
+    # min_region_px: dynamic — tool_radius_px for stripe patterns, 80 for coarse textures
     labels = _region_aware_quantize(
         heightfield,
         n_levels=n,
-        smoothing_sigma=2.0,
-        min_region_px=80,
+        smoothing_sigma=1.0,
+        min_region_px=max(10, int(tool_radius_px)),
     )
     cv2.imwrite("debug_step1_quantize.png", _labels_to_img(labels))
 
