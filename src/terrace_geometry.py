@@ -49,6 +49,7 @@ class TactileIntent:
     terrace_steps: int = 8
     physical_size_mm: float = 150.0
     target_resolution: int = 512
+    stripe_expansion_factor: float = 0.0  # 0=disabled; >0: merge stripes until period >= factor*tool_diameter
 
 
 @dataclass
@@ -372,6 +373,200 @@ def _apply_grain_periodicity(
         hf_out = (hf_out - lo) / (hi - lo)
 
     return hf_out.astype(np.float32)
+
+
+def _stripe_structure_tensor(
+    src: np.ndarray,
+    smooth_sigma: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Compute structure tensor on src, return (angle_map, coherence, mean_coherence).
+
+    angle_map   : dominant gradient direction in [-pi/2, pi/2] (perpendicular to stripes).
+    coherence   : per-pixel anisotropy [0, 1].
+    mean_coherence: scalar mean.
+    """
+    gx = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=3)
+    Jxx = gaussian_filter(gx * gx, sigma=smooth_sigma)
+    Jyy = gaussian_filter(gy * gy, sigma=smooth_sigma)
+    Jxy = gaussian_filter(gx * gy, sigma=smooth_sigma)
+    angle_map = 0.5 * np.arctan2(2.0 * Jxy, Jxx - Jyy)
+    disc = np.sqrt(np.maximum((Jxx - Jyy) ** 2 * 0.25 + Jxy ** 2, 0.0))
+    l1 = 0.5 * (Jxx + Jyy) + disc
+    l2 = 0.5 * (Jxx + Jyy) - disc
+    coherence = (l1 - l2) / (l1 + l2 + 1e-8)
+    return angle_map, coherence, float(coherence.mean())
+
+
+def _mean_stripe_normal(
+    angle_map: np.ndarray,
+    coherence: np.ndarray,
+) -> float:
+    """Coherence-weighted circular mean of stripe-normal angle (radians)."""
+    mask = coherence > float(coherence.max()) * 0.3
+    z = (coherence[mask] * np.exp(2j * angle_map[mask])).sum()
+    return float(np.angle(z) / 2.0)
+
+
+def _rotate_and_blur_cross(
+    arr: np.ndarray,
+    rotation_deg: float,
+    sigma_cross: float,
+    sharpen_strength: float,
+) -> np.ndarray:
+    """Rotate arr, blur axis-1 (cross-stripe), optional unsharp, rotate back."""
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    H, W = arr.shape
+    center = (W / 2.0, H / 2.0)
+    M_fwd = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+    M_bwd = cv2.getRotationMatrix2D(center, -rotation_deg, 1.0)
+    rotated = cv2.warpAffine(arr.astype(np.float32), M_fwd, (W, H),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    blurred = _gf1d(rotated, sigma=sigma_cross, axis=1)
+    if sharpen_strength > 0.0:
+        coarse = _gf1d(blurred, sigma=sigma_cross * 2.0, axis=1)
+        blurred = blurred + sharpen_strength * (blurred - coarse)
+    out = cv2.warpAffine(blurred, M_bwd, (W, H),
+                         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    lo, hi = float(out.min()), float(out.max())
+    if hi - lo > 1e-8:
+        out = (out - lo) / (hi - lo)
+    return out.astype(np.float32)
+
+
+def expand_stripe_period(
+    hf: np.ndarray,
+    pixel_size_mm: float,
+    tool_diameter_mm: float = 6.0,
+    target_period_factor: float = 1.5,
+    sharpen_strength: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Expand dense stripe spacing in the heightfield to period >= factor × tool_diameter.
+
+    Works directly on the heightfield (diffusion output preserves stripe structure).
+    Returns (hf_expanded, coherence_map, mean_normal_rad) so the caller can:
+      - use coherence_map as a protection mask for morphological opening
+      - use mean_normal_rad for anisotropic edge blurring
+
+    No-op (returns hf unchanged) when mean coherence < 0.05.
+    coherence_map and mean_normal_rad are still returned for use downstream.
+    """
+    H, W = hf.shape
+    smooth_sigma = max(min(H, W) // 32, 3)
+
+    angle_map, coherence, mean_coh = _stripe_structure_tensor(hf, smooth_sigma)
+
+    if mean_coh < 0.05:
+        print(f"  [stripe_expand] coherence={mean_coh:.3f} < 0.05, no clear stripes")
+        return hf.copy(), coherence, 0.0
+
+    mean_normal_rad = _mean_stripe_normal(angle_map, coherence)
+    rotation_deg = -float(np.degrees(mean_normal_rad))
+
+    target_period_px = (tool_diameter_mm * target_period_factor) / pixel_size_mm
+    sigma_cross = max(target_period_px / (2.0 * np.pi), 1.0)
+
+    print(f"  [stripe_expand] normal={np.degrees(mean_normal_rad):.1f}°  "
+          f"coherence={mean_coh:.3f}  "
+          f"target={target_period_px:.1f}px  sigma_cross={sigma_cross:.1f}px")
+
+    hf_out = _rotate_and_blur_cross(hf, rotation_deg, sigma_cross, sharpen_strength)
+    return hf_out, coherence, mean_normal_rad
+
+
+def _anisotropic_stripe_blur(
+    hf: np.ndarray,
+    mean_normal_rad: float,
+    sigma_along: float,
+    sigma_across: float,
+) -> np.ndarray:
+    """Gaussian blur with different sigma along and across stripe direction.
+
+    Rotate so stripes are vertical, then blur:
+      axis=0 (Y, along stripes): sigma_along  — softens step risers along grain
+      axis=1 (X, across stripes): sigma_across — minimal, preserves stripe spacing
+    Rotate back.
+    """
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    H, W = hf.shape
+    rotation_deg = -float(np.degrees(mean_normal_rad))
+    center = (W / 2.0, H / 2.0)
+    M_fwd = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+    M_bwd = cv2.getRotationMatrix2D(center, -rotation_deg, 1.0)
+    rotated = cv2.warpAffine(hf.astype(np.float32), M_fwd, (W, H),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    rotated = _gf1d(rotated, sigma=sigma_along,  axis=0)  # along stripes
+    rotated = _gf1d(rotated, sigma=sigma_across, axis=1)  # across stripes (small)
+    out = cv2.warpAffine(rotated, M_bwd, (W, H),
+                         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _boost_stripe_amplitude(
+    hf: np.ndarray,
+    mean_normal_rad: float,
+    coherence: np.ndarray,
+    boost_strength: float = 2.5,
+) -> np.ndarray:
+    """Amplify the stripe frequency component along the cross-stripe direction.
+
+    Extracts a directional bandpass (removes both DC background and high-freq noise),
+    then adds back (boost_strength - 1) × that component weighted by coherence.
+    boost_strength=2.5 roughly triples the stripe amplitude.
+    Returns float32 re-normalized to [0, 1].
+    """
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    H, W = hf.shape
+    rotation_deg = -float(np.degrees(mean_normal_rad))
+    center = (W / 2.0, H / 2.0)
+    M_fwd = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+    M_bwd = cv2.getRotationMatrix2D(center, -rotation_deg, 1.0)
+
+    rotated = cv2.warpAffine(hf.astype(np.float32), M_fwd, (W, H),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    # Estimate dominant stripe period from the most coherent row (avoids knot area bias)
+    coh_rs_pre = cv2.resize(coherence.astype(np.float32), (W, H),
+                            interpolation=cv2.INTER_AREA)
+    coh_rot_pre = cv2.warpAffine(coh_rs_pre, M_fwd, (W, H),
+                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    best_row = int(np.argmax(coh_rot_pre.mean(axis=1)))
+    mid = rotated[best_row, :]
+    mid_dm = mid - mid.mean()
+    fft_mag = np.abs(np.fft.rfft(mid_dm))
+    freqs = np.fft.rfftfreq(len(mid_dm))
+    valid = (freqs >= 1.0 / 100) & (freqs <= 0.45)
+    v_idx = np.where(valid)[0]
+    if len(v_idx) > 0:
+        pk = v_idx[int(np.argmax(fft_mag[v_idx]))]
+        period_px = float(1.0 / freqs[pk]) if freqs[pk] > 0 else 20.0
+    else:
+        period_px = 20.0
+
+    sigma_lo = max(period_px * 3.0, 30.0)   # removes DC + large-scale trend
+    sigma_hi = max(period_px * 0.25, 2.0)   # smooths within one stripe ridge
+
+    smooth = _gf1d(rotated, sigma=sigma_hi, axis=1)
+    bg     = _gf1d(rotated, sigma=sigma_lo, axis=1)
+    stripe_component = smooth - bg  # bandpass: stripe ridge frequencies only
+
+    # Weight boost by coherence so only clear-stripe regions are amplified
+    coh_rs = cv2.resize(coherence.astype(np.float32), (W, H),
+                        interpolation=cv2.INTER_AREA)
+    coh_rot = cv2.warpAffine(coh_rs, M_fwd, (W, H),
+                              flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    coh_weight = np.clip(coh_rot / (float(coh_rot.max()) + 1e-8), 0, 1)
+
+    boosted = rotated + (boost_strength - 1.0) * stripe_component * coh_weight
+
+    out = cv2.warpAffine(boosted, M_bwd, (W, H),
+                         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    lo, hi = float(out.min()), float(out.max())
+    if hi - lo > 1e-8:
+        out = (out - lo) / (hi - lo)
+    print(f"  [stripe_boost] period≈{period_px:.0f}px  boost={boost_strength}×  "
+          f"sigma_hi={sigma_hi:.1f}  sigma_lo={sigma_lo:.1f}")
+    return out.astype(np.float32)
 
 
 def remove_global_trend(hf: np.ndarray, sigma_px: float = 150.0) -> np.ndarray:
@@ -702,6 +897,7 @@ def filter_heightfield_for_machining(
     orientation_map: np.ndarray | None = None,
     source_image: np.ndarray | None = None,
     intent: TactileIntent | None = None,
+    stripe_protect_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, MachiningFilterReport]:
     """
     Apply all machining constraints to a heightfield in a deterministic sequence:
@@ -794,9 +990,17 @@ def filter_heightfield_for_machining(
     else:
         effective_radius = tool_radius_px
     report.morph_radius_px = effective_radius
+    # Merge knot mask and stripe protect mask: either condition → pixel is protected
+    combined_mask: np.ndarray | None = knot_mask if knot_mask.any() else None
+    if stripe_protect_mask is not None:
+        sp = stripe_protect_mask
+        if sp.shape != hf.shape:
+            sp = cv2.resize(sp.astype(np.uint8), (hf.shape[1], hf.shape[0]),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        combined_mask = sp if combined_mask is None else (combined_mask | sp)
     hf = suppress_narrow_recesses(hf, effective_radius,
                                   orientation_map=orientation_map,
-                                  mask=knot_mask)
+                                  mask=combined_mask)
     hf = np.clip(hf, 0.0, 1.0)
     tool_diameter_mm = config.tool_radius_mm * 2.0
     report.recommendations.append(
@@ -1426,6 +1630,21 @@ def preprocess_for_terrace(
                                   (target_resolution, target_resolution),
                                   interpolation=cv2.INTER_AREA)
 
+    # Step 0.5: stripe period expansion (optional)
+    # Expands dense stripes in the diffusion heightfield to machinable spacing,
+    # and returns coherence + direction info used by steps 2 & 3 below.
+    _stripe_coherence: np.ndarray | None = None
+    _stripe_normal_rad: float = 0.0
+    if intent.stripe_expansion_factor > 0.0:
+        hf, _stripe_coherence, _stripe_normal_rad = expand_stripe_period(
+            hf,
+            pixel_size_mm=px_size,
+            tool_diameter_mm=tool_diameter_mm,
+            target_period_factor=float(intent.stripe_expansion_factor),
+            sharpen_strength=0.5,
+        )
+        hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+
     # Step 1: gamma height remapping
     # Clamp gamma to safe range — values < 0.85 compress dynamic range
     # into high end causing step features to flatten out
@@ -1433,23 +1652,42 @@ def preprocess_for_terrace(
     hf = np.power(np.clip(hf, 0.0, 1.0), gamma_safe).astype(np.float32)
 
     # Step 2: morphological opening
-    # Skip if morph_strength <= 0.5 to preserve fine rough texture
-    # Skip if dense stripe pattern detected (period < 2x tool diameter)
+    # Skip if morph_strength <= 0.5 to preserve fine rough texture.
+    # Skip if dense stripe pattern detected (period < 2x tool diameter).
+    # When stripe_expansion_factor > 0: use coherence mask to protect
+    # stripe regions from being flattened by the isotropic opening kernel.
     if intent.morph_strength > 0.5:
-        # Stripe protection: dense stripes would be flattened by opening
         stripe_period = periods_px[0] if periods_px else 999
-        if stripe_period < tool_radius_px * 4:  # period < 2x tool diameter
+        if stripe_period < tool_radius_px * 4:
             print(f"  [morph] skipped — stripe period {stripe_period:.0f}px "
                   f"< 2x tool diameter {tool_radius_px*2:.0f}px")
         else:
             effective_radius_px = tool_radius_px * intent.morph_strength
             max_radius_px = target_resolution * 0.05
             effective_radius_px = min(effective_radius_px, max_radius_px)
-            hf = suppress_narrow_recesses(hf, effective_radius_px)
+            # Protect high-coherence stripe regions from isotropic opening
+            stripe_mask: np.ndarray | None = None
+            if _stripe_coherence is not None:
+                coh_max = float(_stripe_coherence.max())
+                if coh_max > 1e-6:
+                    stripe_mask = _stripe_coherence > coh_max * 0.4
+                    n_protected = int(stripe_mask.sum())
+                    print(f"  [morph] stripe mask: {n_protected} px protected")
+            hf = suppress_narrow_recesses(hf, effective_radius_px, mask=stripe_mask)
 
     # Step 3: edge_sigma
-    edge_sigma_px = np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0])
-    hf = gaussian_filter(hf.astype(np.float32), sigma=edge_sigma_px)
+    # When stripe_expansion_factor > 0 and a clear stripe direction is known,
+    # use anisotropic blur: normal sigma along stripes, minimal sigma across.
+    # This softens step risers along grain without smearing the stripe spacing.
+    edge_sigma_px = float(np.interp(intent.edge_sigma, [0.5, 4.5], [0.5, 3.0]))
+    if _stripe_coherence is not None and float(_stripe_coherence.mean()) >= 0.05:
+        sigma_along  = edge_sigma_px
+        sigma_across = max(edge_sigma_px * 0.15, 0.3)  # nearly zero across stripes
+        hf = _anisotropic_stripe_blur(hf, _stripe_normal_rad, sigma_along, sigma_across)
+        print(f"  [edge_sigma] anisotropic: along={sigma_along:.2f}px  "
+              f"across={sigma_across:.2f}px")
+    else:
+        hf = gaussian_filter(hf.astype(np.float32), sigma=edge_sigma_px)
 
     # Pre-quantisation smoothing removed —
     # _region_aware_quantize(smoothing_sigma=2.0) handles noise internally.
@@ -1534,8 +1772,8 @@ def heightfield_to_terrace_mesh(
             across_sigma=0.5,
         )
 
-    # Step 2: DISABLED
-    # labels = _enforce_min_recess_width(labels, tool_radius_px, n)
+    # Step 2: Enforce minimum recess width >= tool diameter on quantised labels.
+    labels = _enforce_min_recess_width(labels, tool_radius_px, n)
     cv2.imwrite("debug_step2_enforce.png", _labels_to_img(labels))
 
     # Step 3: Resolve checkerboard saddle points that produce non-manifold edges.
@@ -1784,6 +2022,16 @@ class SaliencyConfig:
     terrace_steps_low: int = 4
     saliency_threshold_high: float = 0.65
     saliency_threshold_low: float = 0.30
+
+    # Stripe preservation: expand dense parallel stripes to machinable spacing
+    # before the morphological opening step.
+    # 0 = disabled; 1.5 = target period = 1.5 × tool_diameter (recommended).
+    stripe_expansion_factor: float = 0.0
+
+    # Stripe amplitude boost: amplify the stripe bandpass component to make stripes
+    # survive terracing.  Applied before the machining filter whenever coherence > 0.06.
+    # 1.0 = no boost; 2.5 = default (stripe amplitude × ~2.5); max useful ≈ 4.0.
+    stripe_boost_strength: float = 2.5
 
 @dataclass
 class SaliencyReport:
@@ -2307,6 +2555,12 @@ def heightfield_to_saliency_adaptive_terrace(
     hf_composite = gaussian_filter(hf_composite, sigma=riser_sigma)
     hf_composite = np.clip(hf_composite, 0.0, 1.0).astype(np.float32)
 
+    # Enforce 6mm tool constraint: suppress recesses narrower than tool diameter.
+    # The zone-blending above can create sub-tool-width transitions at boundaries.
+    tool_radius_px = (terrace_config.tool_diameter_mm / 2.0) / pixel_size_mm
+    hf_composite = suppress_narrow_recesses(hf_composite, tool_radius_px)
+    hf_composite = np.clip(hf_composite, 0.0, 1.0).astype(np.float32)
+
     # Use the standard terrace mesh builder with steps_high
     tc = TerraceConfig(
         physical_size_mm  = terrace_config.physical_size_mm,
@@ -2370,11 +2624,27 @@ def run_saliency_pipeline(
     hf = hf.astype(np.float32)
     print(f"  After detrend: std={hf.std():.4f} (should be > 0.14)")
 
+    # Step 0c: CLAHE — boost local contrast for both weight computation and geometry.
+    # Low-contrast regions (e.g. uniform bright wood grain) produce w_height_range ≈ 0
+    # and near-flat geometry without this step.
+    # Geometry CLAHE uses larger tiles (4×4, clip=1.5) to preserve large-scale shape
+    # (knot valleys stay valleys); weight CLAHE uses finer tiles (8×8, clip=2.0) for
+    # more sensitive low-contrast detection.
+    print("Applying CLAHE local contrast enhancement...")
+    hf_original   = hf.copy()
+    hf_clahe      = _remove_heightmap_bias(hf, clip_limit=1.5, tile_grid_size=4)
+    # Blend 40% CLAHE + 60% original: boosts low-contrast regions without
+    # over-amplifying existing high-contrast areas or creating edge artifacts.
+    hf            = 0.4 * hf_clahe + 0.6 * hf_original
+    hf            = np.clip(hf, 0.0, 1.0).astype(np.float32)
+    hf_for_weight = _remove_heightmap_bias(hf, clip_limit=2.0, tile_grid_size=8)
+    print(f"  Geometry std={hf.std():.4f}  Weight std={hf_for_weight.std():.4f}")
+
     # Step 1: Multi-scale FFT + structure tensor + height range → weight map
     print("Computing machinability weight map...")
     tool_diameter_mm = config.tool_radius_mm * 2.0
     weight_map, sal_report, orientation_map, period_map = compute_machinability_weight(
-        hf, hf, config.physical_size_mm, tool_diameter_mm,
+        hf_for_weight, hf_for_weight, config.physical_size_mm, tool_diameter_mm,
         config.max_height_mm, saliency_config
     )
     print(f"  Weight: mean={sal_report.weight_mean:.3f}, "
@@ -2399,6 +2669,46 @@ def run_saliency_pipeline(
 
     hf = normalize_heightfield(hf)
 
+    # Step 2.5: Stripe preservation — boost period (optional) + always-on protection mask.
+    # Protection is always computed when coherence > 0.05 so stripes survive the
+    # isotropic morphological opening even without the expansion slider.
+    _stripe_protect_mask: np.ndarray | None = None
+    pixel_size_mm_cur = config.physical_size_mm / max(hf.shape[0] - 1, 1)
+
+    _sm25 = max(min(hf.shape) // 32, 3)
+    if saliency_config.stripe_expansion_factor > 0.0:
+        # Expand stripe period to machinable spacing (slider-controlled).
+        # Boost runs AFTER expansion so the expansion blur doesn't cancel the boost.
+        print(f"Expanding stripe period (factor={saliency_config.stripe_expansion_factor})...")
+        hf, _stripe_coh_25, _stripe_normal_25 = expand_stripe_period(
+            hf,
+            pixel_size_mm=pixel_size_mm_cur,
+            tool_diameter_mm=config.tool_radius_mm * 2.0,
+            target_period_factor=saliency_config.stripe_expansion_factor,
+            sharpen_strength=0.5,
+        )
+        hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+    else:
+        # No expansion — compute coherence + normal for boost and protection
+        _angle_25, _stripe_coh_25, _ = _stripe_structure_tensor(hf, _sm25)
+        _stripe_normal_25 = _mean_stripe_normal(_angle_25, _stripe_coh_25)
+
+    # Boost stripe amplitude AFTER expansion (expansion blur would undo a pre-boost)
+    _coh_max_25  = float(_stripe_coh_25.max())
+    _coh_mean_25 = float(_stripe_coh_25.mean())
+    if _coh_mean_25 > 0.06 and saliency_config.stripe_boost_strength > 1.0:
+        print(f"Boosting stripe amplitude (strength={saliency_config.stripe_boost_strength}, "
+              f"coherence={_coh_mean_25:.3f})...")
+        hf = _boost_stripe_amplitude(hf, _stripe_normal_25, _stripe_coh_25,
+                                     boost_strength=saliency_config.stripe_boost_strength)
+        print(f"  After boost: std={hf.std():.4f}")
+
+    # Build protection mask regardless of expansion/boost
+    if _coh_max_25 > 1e-6 and _coh_mean_25 >= 0.05:
+        _stripe_protect_mask = _stripe_coh_25 > _coh_max_25 * 0.2
+        print(f"  Auto stripe protect: {int(_stripe_protect_mask.sum())} px protected "
+              f"(mean_coh={_coh_mean_25:.3f})")
+
     # Step 3: Standard machining filter (prune, knot protection, ADC, slope)
     print("Applying machining filter...")
     hf_filtered, mach_report = filter_heightfield_for_machining(
@@ -2416,7 +2726,8 @@ def run_saliency_pipeline(
             terrace_mode           = True,
         ),
         orientation_map=orientation_map,
-        source_image=None,  # already handled by three_region preprocessing
+        source_image=None,
+        stripe_protect_mask=_stripe_protect_mask,
     )
     print(f"  Machining filter: passed={mach_report.passed}")
 

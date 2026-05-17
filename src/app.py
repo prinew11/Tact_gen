@@ -303,6 +303,8 @@ def run_saliency_geometry(
     mesh_resolution: int,
     fft_stride: int, fft_energy_threshold: float, weight_blur_sigma: float,
     structure_sigma: float, tool_angle: float, tool_tolerance: float,
+    stripe_expansion_factor: float = 0.0,
+    stripe_boost_strength: float = 2.5,
 ):
     """Multi-scale FFT + structure tensor + height range → machinability-weighted terrace."""
     try:
@@ -343,6 +345,8 @@ def run_saliency_geometry(
                 terrace_steps_low=int(steps_low),
                 saliency_threshold_high=float(thresh_high),
                 saliency_threshold_low=float(thresh_low),
+                stripe_expansion_factor=float(stripe_expansion_factor),
+                stripe_boost_strength=float(stripe_boost_strength),
             ),
             save_saliency_map=str(OUT / "weight_map.png"),
         )
@@ -585,6 +589,7 @@ def run_intent_generation(
     tool_radius: float,
     mesh_resolution: int,
     grain_enabled: bool = False,
+    stripe_expansion_factor: float = 0.0,
 ):
     """Full intent pipeline: image → heightmap → intent → terrace STL."""
     try:
@@ -617,8 +622,8 @@ def run_intent_generation(
         _load_intent_resources()
         params = predict_intent(glcm_target, _intent_model, _intent_scaler, _intent_meta)
 
-        # Fixed intent parameter table — bypasses MLP for known intents
-        # morph_strength fixed at 0.8 for all intents to prevent feature flattening
+        # Known intents use hand-tuned fixed params (reliable output quality).
+        # Unknown intents fall back to MLP (GLCM vector → params).
         INTENT_PARAMS = {
             "rough":   {"gamma": 2.0, "edge_sigma": 0.5, "morph_strength": 0.4, "steps": 10},
             "soft":    {"gamma": 1.0, "edge_sigma": 4.5, "morph_strength": 0.8, "steps": 8},
@@ -635,28 +640,24 @@ def run_intent_generation(
         ]
 
         if len(intent_words) == 1 and intent_words[0] in INTENT_PARAMS:
-            # Single known intent: use fixed param table directly, skip MLP
             p = INTENT_PARAMS[intent_words[0]]
-            final_gamma        = p["gamma"]
-            final_edge_sigma   = p["edge_sigma"]
-            final_morph        = p["morph_strength"]
-            final_steps        = p["steps"]
+            final_gamma      = p["gamma"]
+            final_edge_sigma = p["edge_sigma"]
+            final_morph      = p["morph_strength"]
+            final_steps      = p["steps"]
 
         elif len(intent_words) > 1 and all(w in INTENT_PARAMS for w in intent_words):
-            # Blended known intents: element-wise mean of fixed params
-            final_gamma      = sum(INTENT_PARAMS[w]["gamma"]        for w in intent_words) / len(intent_words)
-            final_edge_sigma = sum(INTENT_PARAMS[w]["edge_sigma"]   for w in intent_words) / len(intent_words)
-            final_morph      = 0.8  # always fixed regardless of blend
-            final_steps      = int(round(
-                sum(INTENT_PARAMS[w]["steps"] for w in intent_words) / len(intent_words)
-            ))
+            final_gamma      = sum(INTENT_PARAMS[w]["gamma"]      for w in intent_words) / len(intent_words)
+            final_edge_sigma = sum(INTENT_PARAMS[w]["edge_sigma"]  for w in intent_words) / len(intent_words)
+            final_morph      = sum(INTENT_PARAMS[w]["morph_strength"] for w in intent_words) / len(intent_words)
+            final_steps      = int(round(sum(INTENT_PARAMS[w]["steps"] for w in intent_words) / len(intent_words)))
 
         else:
-            # Unknown intent: fall back to MLP but clamp morph_strength
-            final_gamma      = float(np.clip(params["gamma"],        0.85, 1.8))
-            final_edge_sigma = float(np.clip(params["edge_sigma"],   0.5,  4.5))
-            final_morph      = 0.8  # always fixed
-            final_steps      = params.get("terrace_steps", 8)
+            # Unknown intent: use MLP prediction
+            final_gamma      = float(np.clip(params["gamma"],         0.85, 1.8))
+            final_edge_sigma = float(np.clip(params["edge_sigma"],    0.5,  4.5))
+            final_morph      = float(np.clip(params["morph_strength"], 0.5, 2.0))
+            final_steps      = int(params.get("terrace_steps", 8))
 
         final_steps = max(final_steps, MIN_TERRACE_STEPS)
 
@@ -673,6 +674,7 @@ def run_intent_generation(
             terrace_steps=int(final_steps),
             physical_size_mm=float(physical_size),
             target_resolution=512,
+            stripe_expansion_factor=float(stripe_expansion_factor),
         )
 
         # Step 4: continuous heightmap × intent → stepped heightmap
@@ -720,7 +722,8 @@ def run_intent_generation(
             f"edge_sigma={final_edge_sigma:.2f}  "
             f"morph={final_morph:.2f}  "
             f"steps={intent.terrace_steps}  "
-            f"grain={grain_strength:.2f}\n\n"
+            f"grain={grain_strength:.2f}  "
+            f"stripe_exp={stripe_expansion_factor:.1f}\n\n"
             f"**Mesh**\n"
             f"- Faces: {ter_report.face_count:,}\n"
             f"- Watertight: {ter_report.watertight}\n"
@@ -895,6 +898,20 @@ def build_app() -> gr.Blocks:
                     64, 512, value=256, step=32,
                     label="Mesh resolution",
                 )
+            with gr.Row():
+                inp_sal_stripe = gr.Slider(
+                    0.0, 3.0, value=0.0, step=0.1,
+                    label="Stripe expansion (× tool diameter, 0 = off)",
+                    info="Expand dense parallel stripes to machinable spacing. "
+                         "1.5 = target spacing 1.5× tool diameter.",
+                )
+                inp_sal_boost = gr.Slider(
+                    1.0, 5.0, value=2.5, step=0.1,
+                    label="Stripe boost strength",
+                    info="Amplify stripe amplitude before terracing. "
+                         "Auto-on when stripes detected (coherence > 0.06). "
+                         "1.0 = off, 2.5 = default (2.5× stripe amplitude).",
+                )
             btn_sal = gr.Button("Run Saliency Pipeline", variant="primary")
             with gr.Row():
                 out_sal_hf = gr.Image(label="Machinable heightmap (2D)")
@@ -909,7 +926,8 @@ def build_app() -> gr.Blocks:
                         inp_sal_thresh_hi, inp_sal_thresh_lo,
                         inp_sal_mesh_res,
                         inp_sal_fft_stride, inp_sal_fft_thresh, inp_sal_blur,
-                        inp_sal_struct_sigma, inp_sal_tool_angle, inp_sal_tolerance],
+                        inp_sal_struct_sigma, inp_sal_tool_angle, inp_sal_tolerance,
+                        inp_sal_stripe, inp_sal_boost],
                 outputs=[out_sal_hf, out_sal_stl, out_sal_saliency, out_sal_info],
             )
 
@@ -951,6 +969,12 @@ def build_app() -> gr.Blocks:
                                          label="Mesh resolution")
             inp_int_grain = gr.Checkbox(value=False,
                                         label="Enable grain warp (dense parallel stripe patterns)")
+            inp_int_stripe = gr.Slider(
+                0.0, 3.0, value=0.0, step=0.1,
+                label="Stripe expansion (× tool diameter, 0 = off)",
+                info="Merge dense parallel stripes into wider ones of the same direction. "
+                     "1.5 = target spacing 1.5× tool diameter (9 mm for 6 mm tool).",
+            )
             btn_int = gr.Button("Generate", variant="primary")
             with gr.Row():
                 out_int_hf = gr.Image(label="Stepped heightmap")
@@ -960,7 +984,7 @@ def build_app() -> gr.Blocks:
                 run_intent_generation,
                 inputs=[inp_int_img, inp_int_text,
                         inp_int_size, inp_int_h, inp_int_tr, inp_int_res,
-                        inp_int_grain],
+                        inp_int_grain, inp_int_stripe],
                 outputs=[out_int_hf, out_int_stl, out_int_info],
             )
 
