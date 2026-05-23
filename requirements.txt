@@ -18,3 +18,5 @@ tqdm
 networkx
 shapely
 rtree
+anthropic>=0.30.0
+openai>=1.0.0

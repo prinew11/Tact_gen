@@ -4,6 +4,7 @@ Run:  python src/app.py
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -438,6 +439,114 @@ def run_mockup(heightfield_file, physical_size: float, max_height: float):
         raise gr.Error(f"Mockup failed: {e}")
 
 
+# ===== 6. Agent Transform ====================================================
+
+def run_agent_transform(
+    image: np.ndarray | None,
+    user_intent: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    max_iterations: int,
+    diffusion_steps: int,
+):
+    """Run the agent pipeline: image -> diffusion -> agent transform -> terrace STL."""
+    if image is None:
+        raise gr.Error("Upload an image.")
+    if not user_intent.strip():
+        raise gr.Error("Enter a tactile intent description.")
+    try:
+        import cv2
+        from agent_planner import run_agent_pipeline, AgentConfig
+        from heightmap_analyzer import analysis_to_text, compare_analyses, analysis_to_json
+        from diffusion_pipeline import DiffusionConfig, generate_heightfield
+        from terrace_geometry import (
+            TerraceConfig,
+            heightfield_to_terrace_mesh,
+            save_stl,
+        )
+
+        # Generate raw heightmap from image
+        rgb = cv2.resize(image, (512, 512), interpolation=cv2.INTER_AREA)
+        diff_config = DiffusionConfig(num_inference_steps=int(diffusion_steps))
+        raw_hf = generate_heightfield(rgb, diff_config)
+
+        t0 = time.time()
+        agent_config = AgentConfig(
+            model=model,
+            max_iterations=int(max_iterations),
+            api_key=api_key.strip(),
+            base_url=base_url.strip(),
+        )
+        result = run_agent_pipeline(raw_hf, user_intent, agent_config)
+
+        # Convert agent output to terrace STL
+        # Skip preprocess_for_terrace — agent output already has clean features.
+        # Pass directly to heightfield_to_terrace_mesh which handles quantization
+        # and min-recess enforcement internally.
+        agent_dir = OUT / "agent_run"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        np.save(str(agent_dir / "heightfield_agent.npy"), result.heightmap)
+
+        # Normalize to [0,1] and mild morphology only (no aggressive pruning)
+        agent_hf = np.clip(result.heightmap, 0.0, 1.0).astype(np.float32)
+
+        tc = TerraceConfig(
+            physical_size_mm=50.0,
+            max_height_mm=5.0,
+            tool_diameter_mm=6.0,
+            terrace_steps=10,
+        )
+        mesh, _report = heightfield_to_terrace_mesh(agent_hf, tc)
+        stl_path = agent_dir / "terrace.stl"
+        save_stl(mesh, stl_path)
+
+        (agent_dir / "analysis_before.json").write_text(
+            analysis_to_json(result.analysis_before)
+        )
+        (agent_dir / "analysis_after.json").write_text(
+            analysis_to_json(result.analysis_after)
+        )
+
+        elapsed = time.time() - t0
+
+        # Build before/after comparison
+        before_text = analysis_to_text(result.analysis_before)
+        after_text = analysis_to_text(result.analysis_after)
+        comparison = compare_analyses(result.analysis_before, result.analysis_after)
+
+        log_lines = []
+        for entry in result.conversation_log:
+            for item in entry.get("content", []):
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        log_lines.append(item["text"][:200])
+                    elif item.get("type") == "tool_use":
+                        log_lines.append(f"**Tool**: `{item['name']}`({json.dumps(item.get('input', {}))[:100]})")
+
+        stl_preview = _render_heightmap_3d(agent_hf, 50.0, 5.0, title="Agent Terrace")
+
+        info = (
+            f"**Agent Transform done** ({elapsed:.1f}s)\n\n"
+            f"- Intent: \"{user_intent}\"\n"
+            f"- Model: {model}\n"
+            f"- Iterations used: {result.iterations_used}\n"
+            f"- STL saved: `{stl_path.relative_to(ROOT)}`\n\n"
+            f"---\n\n"
+            f"### Before Analysis\n{before_text}\n\n"
+            f"### After Analysis\n{after_text}\n\n"
+            f"### Comparison\n{comparison}\n\n"
+            f"### Evaluation\n{result.evaluation_notes}"
+        )
+        if log_lines:
+            info += "\n\n### Agent Log\n" + "\n".join(f"- {l}" for l in log_lines[:20])
+
+        return _arr_to_uint8(raw_hf), _arr_to_uint8(result.heightmap), stl_preview, info
+
+    except Exception as e:
+        raise gr.Error(f"Agent transform failed: {e}")
+
+
 # ===== 7. Environment Check =================================================
 
 def run_env_check():
@@ -521,220 +630,6 @@ def _make_test_heightfield(size: int = 512) -> np.ndarray:
 
 
 # ===== Build UI =============================================================
-
-# ===== 6. Intent-Based Generation ===========================================
-
-_intent_model = None
-_intent_scaler = None
-_intent_meta = None
-_intent_anchors = None
-
-
-def _load_intent_resources():
-    global _intent_model, _intent_scaler, _intent_meta, _intent_anchors
-    if _intent_model is not None:
-        return
-
-    import json
-    from training.intent_mlp import load_model
-
-    model_dir = ROOT / "models" / "intent_mlp"
-    anchor_path = ROOT / "data" / "intent_anchors.json"
-
-    if not (model_dir / "best.pt").exists():
-        raise FileNotFoundError(
-            f"Intent MLP not found at {model_dir}. "
-            "Run: python -m src.training.intent_mlp"
-        )
-    if not anchor_path.exists():
-        raise FileNotFoundError(
-            f"Intent anchors not found at {anchor_path}. "
-            "Run: python scripts/generate_intent_anchors.py"
-        )
-
-    _intent_model, _intent_scaler, _intent_meta = load_model(str(model_dir))
-    with open(anchor_path) as f:
-        _intent_anchors = json.load(f)
-
-
-def _parse_intent(text: str) -> list[float]:
-    """Parse intent text → 9-dim GLCM target vector.
-
-    Supports single words ("rough") and blends ("soft and rough").
-    """
-    _load_intent_resources()
-    anchors = _intent_anchors["intents"]
-    words = text.lower().strip().split()
-
-    matched = []
-    for w in words:
-        if w in ("and", "&", "+", ","):
-            continue
-        if w in anchors:
-            matched.append(w)
-
-    if not matched:
-        available = ", ".join(anchors.keys())
-        raise ValueError(f"Unknown intent '{text}'. Available: {available}")
-
-    vecs = [np.array(anchors[w]) for w in matched]
-    return (np.sum(vecs, axis=0) / len(vecs)).tolist()
-
-
-def run_intent_generation(
-    image: np.ndarray | None,
-    intent_text: str,
-    physical_size: float,
-    max_height: float,
-    tool_radius: float,
-    mesh_resolution: int,
-    grain_enabled: bool = False,
-    stripe_expansion_factor: float = 0.0,
-):
-    """Full intent pipeline: image → heightmap → intent → terrace STL."""
-    try:
-        # Convert checkbox to grain strength: True=20 (full), False=0 (off)
-        grain_strength = 20.0 if grain_enabled else 0.0
-        from terrace_geometry import (
-            TerraceConfig, TactileIntent,
-            preprocess_for_terrace,
-            heightfield_to_terrace_mesh,
-            save_stl as terrace_save_stl,
-        )
-        from diffusion_pipeline import DiffusionConfig, generate_heightfield
-        from training.intent_mlp import predict_intent
-
-        if image is None:
-            return None, None, "Error: no image uploaded."
-
-        # Extract grayscale for grain modulation
-        import cv2 as _cv2
-        image_gray = _cv2.cvtColor(image, _cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-
-        # Step 1: image → continuous heightmap
-        diff_config = DiffusionConfig(num_inference_steps=50)
-        hf = generate_heightfield(image, diff_config)
-
-        # Step 2: intent text → GLCM target vector
-        glcm_target = _parse_intent(intent_text)
-
-        # Step 3: GLCM target → TactileIntent params (MLP)
-        _load_intent_resources()
-        params = predict_intent(glcm_target, _intent_model, _intent_scaler, _intent_meta)
-
-        # Known intents use hand-tuned fixed params (reliable output quality).
-        # Unknown intents fall back to MLP (GLCM vector → params).
-        INTENT_PARAMS = {
-            "rough":   {"gamma": 2.0, "edge_sigma": 0.5, "morph_strength": 0.4, "steps": 10},
-            "soft":    {"gamma": 1.0, "edge_sigma": 4.5, "morph_strength": 0.8, "steps": 8},
-            "hard":    {"gamma": 1.0, "edge_sigma": 0.5, "morph_strength": 0.8, "steps": 8},
-            "organic": {"gamma": 1.3, "edge_sigma": 2.0, "morph_strength": 0.8, "steps": 8},
-        }
-
-        MIN_TERRACE_STEPS = 8
-
-        anchors = _intent_anchors["intents"]
-        intent_words = [
-            w for w in intent_text.lower().split()
-            if w not in ("and", "&", "+", ",") and w in anchors
-        ]
-
-        if len(intent_words) == 1 and intent_words[0] in INTENT_PARAMS:
-            p = INTENT_PARAMS[intent_words[0]]
-            final_gamma      = p["gamma"]
-            final_edge_sigma = p["edge_sigma"]
-            final_morph      = p["morph_strength"]
-            final_steps      = p["steps"]
-
-        elif len(intent_words) > 1 and all(w in INTENT_PARAMS for w in intent_words):
-            final_gamma      = sum(INTENT_PARAMS[w]["gamma"]      for w in intent_words) / len(intent_words)
-            final_edge_sigma = sum(INTENT_PARAMS[w]["edge_sigma"]  for w in intent_words) / len(intent_words)
-            final_morph      = sum(INTENT_PARAMS[w]["morph_strength"] for w in intent_words) / len(intent_words)
-            final_steps      = int(round(sum(INTENT_PARAMS[w]["steps"] for w in intent_words) / len(intent_words)))
-
-        else:
-            # Unknown intent: use MLP prediction
-            final_gamma      = float(np.clip(params["gamma"],         0.85, 1.8))
-            final_edge_sigma = float(np.clip(params["edge_sigma"],    0.5,  4.5))
-            final_morph      = float(np.clip(params["morph_strength"], 0.5, 2.0))
-            final_steps      = int(params.get("terrace_steps", 8))
-
-        final_steps = max(final_steps, MIN_TERRACE_STEPS)
-
-        # More steps needed for periodic grain heightmap
-        if grain_strength > 5:
-            final_steps = max(final_steps, 12)
-        if grain_strength > 12:
-            final_steps = max(final_steps, 16)
-
-        intent = TactileIntent(
-            gamma=final_gamma,
-            edge_sigma=final_edge_sigma,
-            morph_strength=final_morph,
-            terrace_steps=int(final_steps),
-            physical_size_mm=float(physical_size),
-            target_resolution=512,
-            stripe_expansion_factor=float(stripe_expansion_factor),
-        )
-
-        # Step 4: continuous heightmap × intent → stepped heightmap
-        hf_stepped, image_gray_resized = preprocess_for_terrace(
-            hf,
-            tool_diameter_mm=tool_radius * 2.0,
-            intent=intent,
-            image_gray=image_gray,
-            grain_strength=float(grain_strength),
-        )
-
-        # Step 5: stepped heightmap → STL
-        # along_sigma: map grain_strength [0,20] → along_sigma [0,15]
-        along_sigma = float(grain_strength) * 0.75
-
-        tc = TerraceConfig(
-            physical_size_mm=float(physical_size),
-            max_height_mm=float(max_height),
-            base_thickness_mm=3.0,
-            tool_diameter_mm=tool_radius * 2.0,
-            terrace_steps=intent.terrace_steps,
-            mesh_resolution=int(mesh_resolution),
-        )
-        mesh, ter_report = heightfield_to_terrace_mesh(
-            hf_stepped,
-            tc,
-            grain_image=image_gray_resized if grain_strength > 0 else None,
-            grain_along_sigma=along_sigma,
-        )
-
-        stl_path = OUT / "stl_fabrication" / "intent_terrace.stl"
-        stl_path.parent.mkdir(parents=True, exist_ok=True)
-        terrace_save_stl(mesh, stl_path)
-
-        hf_preview = _arr_to_uint8(hf_stepped)
-        stl_preview = _render_heightmap_3d(
-            hf_stepped, float(physical_size), float(max_height),
-            base_thickness=3.0, title=f"Intent: {intent_text}",
-        )
-
-        info = (
-            f"**Intent Generation Done**\n\n"
-            f"- Intent: `{intent_text}`\n"
-            f"- gamma={final_gamma:.2f}  "
-            f"edge_sigma={final_edge_sigma:.2f}  "
-            f"morph={final_morph:.2f}  "
-            f"steps={intent.terrace_steps}  "
-            f"grain={grain_strength:.2f}  "
-            f"stripe_exp={stripe_expansion_factor:.1f}\n\n"
-            f"**Mesh**\n"
-            f"- Faces: {ter_report.face_count:,}\n"
-            f"- Watertight: {ter_report.watertight}\n"
-            f"- STL: `{stl_path.relative_to(ROOT)}`"
-        )
-        return hf_preview, stl_preview, info
-
-    except Exception as e:
-        import traceback
-        return None, None, f"**Error**: {e}\n\n```\n{traceback.format_exc()}\n```"
-
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Tactile Geometry — Module Test", theme=gr.themes.Soft()) as app:
@@ -947,45 +842,62 @@ def build_app() -> gr.Blocks:
                 outputs=[out_moc_img, out_moc_info],
             )
 
-        # ---- Tab 6: Intent Generation ----
-        with gr.Tab("6. Intent Generation"):
+        # ---- Tab 6: Agent Transform ----
+        with gr.Tab("6. Agent Transform"):
             gr.Markdown(
-                "Upload image + describe tactile intent → terrace STL.\n\n"
-                "Available intents: **rough**, **soft**, **hard**, **organic**.\n"
-                "Blend with: `soft and rough`"
+                "LLM agent creatively transforms a heightmap based on your tactile intent.\n\n"
+                "Pipeline: Image → Diffusion → Agent Transform → Terrace STL\n\n"
+                "The agent uses 23 toolkit operations (frequency-aware, creative, patterns, ...) "
+                "and iterates up to N times to match your description.\n\n"
+                "**Requires**: API key for Anthropic or MiMo."
             )
-            inp_int_img = gr.Image(label="Input Image", type="numpy")
-            inp_int_text = gr.Textbox(
-                label="Tactile Intent",
-                placeholder="e.g. rough, soft, soft and rough",
-                value="rough",
+            inp_ag_img = gr.Image(label="Input Image", type="numpy")
+            inp_ag_intent = gr.Textbox(
+                label="Tactile intent",
+                value="rough organic surface with flowing ridges, preserve large-scale contours, convert fine texture to stepped stripes",
+                lines=2,
             )
             with gr.Row():
-                inp_int_size = gr.Slider(100, 200, value=150, step=10,
-                                         label="Physical size (mm)")
-                inp_int_h = gr.Number(label="Max height (mm)", value=5.0)
-                inp_int_tr = gr.Number(label="Tool radius (mm)", value=3.0)
-                inp_int_res = gr.Slider(64, 512, value=256, step=32,
-                                         label="Mesh resolution")
-            inp_int_grain = gr.Checkbox(value=False,
-                                        label="Enable grain warp (dense parallel stripe patterns)")
-            inp_int_stripe = gr.Slider(
-                0.0, 3.0, value=0.0, step=0.1,
-                label="Stripe expansion (× tool diameter, 0 = off)",
-                info="Merge dense parallel stripes into wider ones of the same direction. "
-                     "1.5 = target spacing 1.5× tool diameter (9 mm for 6 mm tool).",
+                inp_ag_api_key = gr.Textbox(
+                    label="API Key",
+                    placeholder="sk-ant-... or tp-...",
+                    type="password",
+                )
+                inp_ag_model = gr.Dropdown(
+                    choices=[
+                        "claude-sonnet-4-20250514",
+                        "claude-haiku-4-5-20251001",
+                        "mimo-v2.5-pro",
+                        "mimo-v2.5",
+                        "mimo-v2-pro",
+                        "mimo-v2-omni",
+                        "mimo-v2-flash",
+                    ],
+                    value="claude-sonnet-4-20250514",
+                    label="LLM Model",
+                    allow_custom_value=True,
+                )
+            inp_ag_base_url = gr.Textbox(
+                label="Base URL (leave empty for Anthropic, or set MiMo URL)",
+                placeholder="https://token-plan-cn.xiaomimimo.com/anthropic",
             )
-            btn_int = gr.Button("Generate", variant="primary")
             with gr.Row():
-                out_int_hf = gr.Image(label="Stepped heightmap")
-                out_int_stl = gr.Image(label="STL 3D preview")
-            out_int_info = gr.Markdown()
-            btn_int.click(
-                run_intent_generation,
-                inputs=[inp_int_img, inp_int_text,
-                        inp_int_size, inp_int_h, inp_int_tr, inp_int_res,
-                        inp_int_grain, inp_int_stripe],
-                outputs=[out_int_hf, out_int_stl, out_int_info],
+                inp_ag_iters = gr.Slider(1, 8, value=5, step=1, label="Max iterations")
+                inp_ag_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Diffusion steps")
+            btn_ag = gr.Button("Run Agent Transform", variant="primary")
+            with gr.Row():
+                out_ag_before = gr.Image(label="Before (raw)")
+                out_ag_after = gr.Image(label="After (agent)")
+            out_ag_stl = gr.Image(label="STL 3D preview")
+            out_ag_info = gr.Markdown()
+            btn_ag.click(
+                run_agent_transform,
+                inputs=[
+                    inp_ag_img, inp_ag_intent,
+                    inp_ag_api_key, inp_ag_base_url,
+                    inp_ag_model, inp_ag_iters, inp_ag_diff_steps,
+                ],
+                outputs=[out_ag_before, out_ag_after, out_ag_stl, out_ag_info],
             )
 
     return app

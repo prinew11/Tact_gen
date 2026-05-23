@@ -1,0 +1,23 @@
+{
+  "roughness": 0.47985900629161665,
+  "directionality": 0.33962464078354915,
+  "frequency": 0.4631582594172653,
+  "glcm_contrast": 3.6364939833236245,
+  "glcm_homogeneity": 0.46111405749733486,
+  "glcm_energy": 0.15416545459601178,
+  "glcm_correlation": 0.5997061113113893,
+  "height_mean": 0.6665411591529846,
+  "height_std": 0.10963068902492523,
+  "height_range": 0.7773643136024475,
+  "gradient_magnitude_mean": 0.057721495628356934,
+  "dominant_gradient_angle_deg": 117.23912048339844,
+  "gradient_coherence": 0.5889091491699219,
+  "low_freq_energy": 0.08869758452759889,
+  "mid_freq_energy": 0.16277050269575147,
+  "high_freq_energy": 0.7485319460608212,
+  "dominant_wavelength_px": 5477.10443135827,
+  "histogram_skewness": 0.04877585172653198,
+  "histogram_bimodality": 0.3446072254683219,
+  "valley_fraction": 0.25,
+  "ridge_fraction": 0.25
+}
