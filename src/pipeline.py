@@ -44,29 +44,46 @@ def image_guided_blend(
     image_path: str,
     raw_hf: np.ndarray,
     image_weight: float = 0.8,
-    blur_sigma: float = 12.0,
+    blur_sigma: float = 3.0,
 ) -> np.ndarray:
     """Blend image gray-level into diffusion output to recover dynamic range.
 
-    The diffusion model often produces near-flat heightmaps (std ~0.015).
-    The original image carries the real structural information. This function
-    blends smoothed image gray (80%) with diffusion output (20%) to produce
-    a heightfield with usable dynamic range before preprocessing.
+    Three-layer separation to eliminate global illumination bias:
+      1. Remove global illumination (sigma=50) — subtracts cross-image
+         brightness gradient (e.g. left-bright-right-dark).
+      2. Mild denoising (sigma=blur_sigma) — removes pixel noise while
+         preserving wood grain structure (period ~8-30px).
+      3. CLAHE local histogram equalization — ensures each local region
+         uses the full height range, preventing bright areas from
+         compressing dark areas into low terrace levels.
 
     Args:
         image_path: Path to the source image.
         raw_hf: Diffusion-generated heightfield.
         image_weight: Weight for image gray component (default 0.8).
-        blur_sigma: Gaussian sigma for smoothing image gray (default 12).
+        blur_sigma: Gaussian sigma for denoising (default 3.0).
 
     Returns:
         Blended heightfield, float32 [0, 1].
     """
     gray = np.array(Image.open(image_path).convert("L"), dtype=np.float32) / 255.0
     gray = cv2.resize(gray, (raw_hf.shape[1], raw_hf.shape[0]), interpolation=cv2.INTER_AREA)
-    gray_smooth = gaussian_filter(gray, sigma=blur_sigma)
 
-    blended = image_weight * _normalize(gray_smooth) + (1.0 - image_weight) * _normalize(raw_hf)
+    # Layer 1: Remove global illumination bias (sigma=50 captures cross-image brightness)
+    gray_global = gaussian_filter(gray, sigma=50)
+    gray_corrected = np.clip(gray - gray_global + 0.5, 0.0, 1.0)
+
+    # Layer 2: Mild denoising (sigma=3 preserves wood grain, removes pixel noise)
+    gray_mf = gaussian_filter(gray_corrected, sigma=blur_sigma)
+    gray_mf = np.clip(gray_mf, 0.0, 1.0)
+
+    # Layer 3: CLAHE local histogram equalization
+    # tileGridSize=(8,8) = each tile covers 1/8 of image → local height range is fully used
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply((gray_mf * 255).astype(np.uint8)).astype(np.float32) / 255.0
+
+    # Blend: image structure (equalized) + diffusion output (model features)
+    blended = image_weight * gray_eq + (1.0 - image_weight) * _normalize(raw_hf)
     return np.clip(blended, 0.0, 1.0).astype(np.float32)
 
 

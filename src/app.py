@@ -479,14 +479,23 @@ def run_agent_transform(
 
         t0 = time.time()
 
-        # Image-guided blend: bypass diffusion's weak dynamic range
+        # Image-guided blend: three-layer separation (illumination → denoise → equalize)
         from scipy.ndimage import gaussian_filter as _gf
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        gray_smooth = _gf(gray, sigma=12)
+        # Layer 1: Remove global illumination bias
+        gray_global = _gf(gray, sigma=50)
+        gray_corrected = np.clip(gray - gray_global + 0.5, 0.0, 1.0)
+        # Layer 2: Mild denoising (preserve wood grain structure)
+        gray_mf = _gf(gray_corrected, sigma=3.0)
+        gray_mf = np.clip(gray_mf, 0.0, 1.0)
+        # Layer 3: CLAHE local histogram equalization
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply((gray_mf * 255).astype(np.uint8)).astype(np.float32) / 255.0
+        # Blend with diffusion output
         def _norm(x):
             lo, hi = float(x.min()), float(x.max())
             return (x - lo) / (hi - lo) if hi - lo > 1e-8 else np.full_like(x, 0.5)
-        blended_hf = np.clip(0.8 * _norm(gray_smooth) + 0.2 * _norm(raw_hf), 0.0, 1.0).astype(np.float32)
+        blended_hf = np.clip(0.8 * gray_eq + 0.2 * _norm(raw_hf), 0.0, 1.0).astype(np.float32)
 
         # Terrace config (shared between preprocess and mesh generation)
         tc = TerraceConfig(
