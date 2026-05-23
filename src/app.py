@@ -479,15 +479,18 @@ def run_agent_transform(
 
         t0 = time.time()
 
-        # Image-guided blend: percentile stretch + mild denoise
+        # Image-guided blend: background subtraction + percentile stretch + denoise
         from scipy.ndimage import gaussian_filter as _gf
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        # 1. Percentile soft normalization (no block boundaries, no halo)
-        lo, hi = np.percentile(gray, 2), np.percentile(gray, 98)
-        gray_norm = np.clip((gray - lo) / (hi - lo + 1e-8), 0.0, 1.0)
-        # 2. Mild denoise (only pixel noise, all wood grain preserved)
+        # 1. Remove large-scale panel structure (sigma=24 ≈ 4.7mm)
+        background = _gf(gray, sigma=24)
+        gray_corrected = np.clip(gray - background + 0.5, 0.0, 1.0)
+        # 2. Percentile soft normalization
+        lo, hi = np.percentile(gray_corrected, 2), np.percentile(gray_corrected, 98)
+        gray_norm = np.clip((gray_corrected - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+        # 3. Mild denoise (only pixel noise, all wood grain preserved)
         gray_clean = _gf(gray_norm, sigma=1.5)
-        # 3. Blend with diffusion output
+        # 4. Blend with diffusion output
         def _norm(x):
             lo, hi = float(x.min()), float(x.max())
             return (x - lo) / (hi - lo) if hi - lo > 1e-8 else np.full_like(x, 0.5)

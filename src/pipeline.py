@@ -47,10 +47,12 @@ def image_guided_blend(
 ) -> np.ndarray:
     """Blend image gray-level into diffusion output to recover dynamic range.
 
-    Simple approach that preserves the image's natural brightness structure:
-      1. Percentile soft-stretch (p2-p98) — full dynamic range, no block boundaries.
-      2. Mild denoise (sigma=1.5) — pixel noise only, all wood grain preserved.
-      3. Blend with diffusion output.
+    Removes large-scale panel structure while preserving wood grain texture:
+      1. Background subtraction (sigma=24) — removes panel-level structure
+         (seams, knot projections) while keeping wood grain (period ~2-8mm).
+      2. Percentile soft-stretch (p2-p98) — full dynamic range, no block boundaries.
+      3. Mild denoise (sigma=1.5) — pixel noise only.
+      4. Blend with diffusion output.
 
     Args:
         image_path: Path to the source image.
@@ -63,14 +65,19 @@ def image_guided_blend(
     gray = np.array(Image.open(image_path).convert("L"), dtype=np.float32) / 255.0
     gray = cv2.resize(gray, (raw_hf.shape[1], raw_hf.shape[0]), interpolation=cv2.INTER_AREA)
 
-    # 1. Percentile soft normalization (no block boundaries, no halo)
-    lo, hi = np.percentile(gray, 2), np.percentile(gray, 98)
-    gray_norm = np.clip((gray - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    # 1. Remove large-scale panel structure (sigma=24 ≈ 4.7mm at 512px/50mm)
+    #    Keeps wood grain (period 2-8mm), removes panel seams and knot projections
+    background = gaussian_filter(gray, sigma=24)
+    gray_corrected = np.clip(gray - background + 0.5, 0.0, 1.0)
 
-    # 2. Mild denoise (only pixel noise, all wood grain structure preserved)
+    # 2. Percentile soft normalization (no block boundaries, no halo)
+    lo, hi = np.percentile(gray_corrected, 2), np.percentile(gray_corrected, 98)
+    gray_norm = np.clip((gray_corrected - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+    # 3. Mild denoise (only pixel noise, all wood grain structure preserved)
     gray_clean = gaussian_filter(gray_norm, sigma=1.5)
 
-    # 3. Blend with diffusion output
+    # 4. Blend with diffusion output
     blended = image_weight * gray_clean + (1.0 - image_weight) * _normalize(raw_hf)
     return np.clip(blended, 0.0, 1.0).astype(np.float32)
 
