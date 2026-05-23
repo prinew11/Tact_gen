@@ -47,12 +47,13 @@ def image_guided_blend(
 ) -> np.ndarray:
     """Blend image gray-level into diffusion output to recover dynamic range.
 
-    Removes large-scale panel structure while preserving wood grain texture:
-      1. Background subtraction (sigma=24) — removes panel-level structure
-         (seams, knot projections) while keeping wood grain (period ~2-8mm).
-      2. Percentile soft-stretch (p2-p98) — full dynamic range, no block boundaries.
-      3. Mild denoise (sigma=1.5) — pixel noise only.
-      4. Blend with diffusion output.
+    Preserves the image's natural brightness structure (including panel-level
+    gradients). Large-scale brightness equalization is handled later in
+    normalize_for_terrace_quantize via CLAHE.
+
+      1. Percentile soft-stretch (p2-p98) — full dynamic range.
+      2. Mild denoise (sigma=1.5) — pixel noise only, all structure preserved.
+      3. Blend with diffusion output.
 
     Args:
         image_path: Path to the source image.
@@ -65,19 +66,14 @@ def image_guided_blend(
     gray = np.array(Image.open(image_path).convert("L"), dtype=np.float32) / 255.0
     gray = cv2.resize(gray, (raw_hf.shape[1], raw_hf.shape[0]), interpolation=cv2.INTER_AREA)
 
-    # 1. Remove large-scale panel structure (sigma=24 ≈ 4.7mm at 512px/50mm)
-    #    Keeps wood grain (period 2-8mm), removes panel seams and knot projections
-    background = gaussian_filter(gray, sigma=24)
-    gray_corrected = np.clip(gray - background + 0.5, 0.0, 1.0)
+    # 1. Percentile soft normalization (no block boundaries, no halo)
+    lo, hi = np.percentile(gray, 2), np.percentile(gray, 98)
+    gray_norm = np.clip((gray - lo) / (hi - lo + 1e-8), 0.0, 1.0)
 
-    # 2. Percentile soft normalization (no block boundaries, no halo)
-    lo, hi = np.percentile(gray_corrected, 2), np.percentile(gray_corrected, 98)
-    gray_norm = np.clip((gray_corrected - lo) / (hi - lo + 1e-8), 0.0, 1.0)
-
-    # 3. Mild denoise (only pixel noise, all wood grain structure preserved)
+    # 2. Mild denoise (only pixel noise, all wood grain structure preserved)
     gray_clean = gaussian_filter(gray_norm, sigma=1.5)
 
-    # 4. Blend with diffusion output
+    # 3. Blend with diffusion output
     blended = image_weight * gray_clean + (1.0 - image_weight) * _normalize(raw_hf)
     return np.clip(blended, 0.0, 1.0).astype(np.float32)
 
@@ -348,6 +344,11 @@ def normalize_for_terrace_quantize(
     NOT an agent editing operation. Remaps the already validated final
     heightfield so terrace quantization uses more available levels.
 
+    Uses CLAHE (tileGridSize=2x2) to equalize left/right brightness
+    imbalance before global percentile normalization. This eliminates
+    systematic height bias (e.g. left mean 0.567 vs right mean 0.461)
+    that would otherwise compress one side into low terrace levels.
+
     Args:
         hf: Heightfield, expected roughly in [0, 1].
         p_low: Lower percentile mapped near 0.
@@ -358,11 +359,18 @@ def normalize_for_terrace_quantize(
         np.ndarray in [0, 1].
     """
     hf = hf.astype(np.float32)
-    lo, hi = np.percentile(hf, [p_low, p_high])
+
+    # CLAHE: 4 large tiles (2x2) equalize regional brightness without visible grid artifacts
+    hf_u8 = (np.clip(hf, 0.0, 1.0) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(2, 2))
+    hf_eq = clahe.apply(hf_u8).astype(np.float32) / 255.0
+
+    # Global percentile normalization
+    lo, hi = np.percentile(hf_eq, [p_low, p_high])
     dynamic = hi - lo
     if dynamic < 1e-6:
         return np.full_like(hf, 0.5, dtype=np.float32)
-    out = (hf - lo) / dynamic
+    out = (hf_eq - lo) / dynamic
     out = np.clip(out, 0.0, 1.0)
     if preserve_margin > 0:
         out = preserve_margin + (1.0 - 2.0 * preserve_margin) * out
