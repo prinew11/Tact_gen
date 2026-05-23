@@ -1,17 +1,16 @@
 """
-LLM agent that plans heightmap transformations using the toolkit.
+LLM agent that plans bounded heightmap enhancements.
 
-Architecture:
-  1. Analyze raw heightmap (via heightmap_analyzer)
+Architecture (Bounded Agent Transform):
+  1. Analyze preprocessed base heightfield (via heightmap_analyzer)
   2. Send analysis + user intent to LLM
-  3. LLM returns structured tool calls
-  4. Execute calls, analyze result
-  5. LLM evaluates result, decides: accept or refine
+  3. LLM uses analysis-only tools and proposes an edit plan
+  4. Plan parameters are extracted and clamped to safe ranges
+  5. Deterministic code applies the plan later (not the LLM)
   6. Max 3 iterations to keep cost/time bounded
 """
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
 
@@ -21,9 +20,8 @@ from heightmap_analyzer import (
     HeightmapAnalysis,
     analyze_heightmap,
     analysis_to_text,
-    compare_analyses,
 )
-from agent_tools import TOOL_SCHEMAS, execute_tool, quick_machinability_check
+from agent_tools import TOOL_SCHEMAS, execute_tool, extract_plan_parameters
 
 
 @dataclass
@@ -31,90 +29,91 @@ class AgentConfig:
     model: str = "claude-sonnet-4-20250514"
     api_key: str = ""
     base_url: str = ""
-    max_iterations: int = 5
+    max_iterations: int = 3
     temperature: float = 0.3
 
 
 @dataclass
+class AgentEditPlan:
+    """Bounded edit parameters returned by the agent. NOT a heightfield."""
+    ridge_boost: float = 0.0       # [0, 0.35]
+    contrast_boost: float = 0.0    # [0, 0.25]
+    texture_amount: float = 0.0    # [0, 0.10]
+    smoothing_sigma: float = 0.0   # [0, 1.5]
+    target_regions: str = "global" # "global", "ridges", "valleys", "high", "low"
+    preserve_large_structures: bool = True
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentResult:
-    heightmap: np.ndarray
+    plan: AgentEditPlan
     analysis_before: HeightmapAnalysis
-    analysis_after: HeightmapAnalysis
+    analysis_after: HeightmapAnalysis | None  # None until plan is applied
     iterations_used: int
     evaluation_notes: str
     conversation_log: list[dict] = field(default_factory=list)
 
 
-SYSTEM_PROMPT = """You are a heightmap transformation agent for CNC-fabricable tactile surfaces.
+SYSTEM_PROMPT = """You are a heightmap enhancement planner for CNC-fabricable tactile surfaces.
 
-You receive a heightmap analysis and a user intent description.
-Your job: call toolkit operations to transform the heightmap to match the user's intent.
+You receive a PREPROCESSED heightmap analysis and a user intent description.
+Your job: analyze the surface and propose BOUNDED ENHANCEMENT PARAMETERS.
 
-You are a CREATOR, not an editor. Make bold, dramatic transformations.
+You are an ENHANCER, not a creator. You modify an existing stable surface within safe bounds.
 
-CRITICAL RULE — NEVER FLATTEN THE HEIGHTMAP:
-- The input heightmap has rich features (roughness, ridges, valleys). You MUST preserve or enhance them.
-- NEVER reduce the heightmap to a smooth/flat surface. The output must have MORE contrast than the input.
-- At most ONE smoothing operation per iteration (e.g. one call to freq_preserve_lowpass or bandpass_filter).
-- Do NOT chain multiple smoothing/blurring operations — they compound and destroy features.
-- If you see height_std drop below 0.08, STOP smoothing and start boosting contrast/ridges.
-- The final heightmap MUST have height_std > 0.10 (measured by evaluate_result).
+CRITICAL RULES:
+1. The heightmap has already been preprocessed for terrace machining. Do NOT flatten it.
+2. All modifications are bounded: ridge boost [0, 0.35], contrast [0, 0.25], texture [0, 0.10].
+3. You CANNOT replace, warp, or redistribute the entire surface.
+4. The terrace mesh generator is the final authority on geometry.
 
-DEFAULT STRATEGY — Boost + Texture:
-1. Analyze the heightmap with analyze_heightmap.
-2. Boost contrast: boost_contrast(gamma=2.0-3.0) to sharpen features.
-3. Enhance ridges: enhance_ridges(strength=1.0-2.0) to amplify linear features.
-4. Add texture: blend_pattern or texture_overlay with amplitude=0.3-0.5.
-5. Directional flow: directional_warp or anisotropic_emphasis for grain direction.
-6. Evaluate: check that roughness and height_std are HIGHER than before.
+ALLOWED TOOLS (analysis and planning only):
+- analyze_heightmap: read current metrics
+- generate_mask: create spatial masks for regional control
+- mask_apply: preview mask effect (requires generate_mask first)
+- evaluate_result: check metrics against intent
+- propose_edit_plan: submit your final bounded enhancement parameters
 
-If the intent asks for "stepped" or "stripes":
-- Use freq_stepped_convert(n_levels=8-12) — NOT fewer levels, which flattens.
-- Apply it ONCE on the original heightmap, not after multiple smoothing ops.
+You may NOT directly mutate the geometry with boost_contrast, enhance_ridges, etc.
+Those operations are applied later by deterministic code based on your plan.
 
-If the intent asks for "smooth" or "soft":
-- Use gentle operations only: boost_contrast(gamma=1.3), enhance_ridges(strength=0.3).
-- Do NOT flatten — "smooth" means reduce roughness slightly, not eliminate features.
+STRATEGY:
+1. Call analyze_heightmap to understand the preprocessed surface.
+2. Optionally generate_mask for spatial targeting.
+3. Call evaluate_result with intent keywords.
+4. Call propose_edit_plan with explicit bounded parameters:
+   - ridge_boost: 0.0-0.35 (enhance_ridges strength)
+   - contrast_boost: 0.0-0.25 (boost_contrast amount)
+   - texture_amount: 0.0-0.10 (texture overlay intensity)
+   - smoothing_sigma: 0.0-1.5 (smoothing sigma)
+   - target_regions: "global", "ridges", "valleys", "high", "low"
+   - summary: brief description of the plan
 
-GUIDELINES:
-- Start with analyze_heightmap to understand the current state.
-- Plan 3-5 operations per iteration. Quality over quantity.
-- Always end with evaluate_result to check progress.
-- Use accept_heightmap when the result matches the intent.
-- Amplitude 0.3-0.8 is normal for additive operations. Don't be timid.
-- The final heightmap must be valid for terrace_geometry: float32 [0,1], 512x512.
-- Max 5 refinement iterations.
-- Downstream terrace_geometry will fix machinability issues — focus on creativity.
-
-AVAILABLE TOOLS (grouped by purpose):
-BOOST: boost_contrast, enhance_ridges, freq_band_boost
-TEXTURE: blend_pattern, texture_overlay, add_perlin_noise
-DIRECTION: directional_warp, anisotropic_emphasis, bend_contours
-REGIONAL: height_selective_transform, height_redistribute, height_zone_remap
-CREATIVE: replace_region, surface_warp, procedural_generate, symmetry_apply
-COMPOSITION: blend_two, generate_mask + mask_apply
-FREQUENCY: freq_preserve_lowpass, freq_stepped_convert, bandpass_filter
-
-MACHINING CONSTRAINTS:
-- Tool: 6mm flat end mill
-- Features narrower than 6mm will be suppressed by downstream processing
-- Maximum physical height: 5mm
-- Keep heightmap values in [0, 1]"""
+Max 3 refinement iterations."""
 
 
 def run_agent_pipeline(
-    raw_heightmap: np.ndarray,
+    base_hf: np.ndarray,
+    raw_hf: np.ndarray,
     user_intent: str,
     config: AgentConfig | None = None,
 ) -> AgentResult:
-    """Main entry point: run the full agent pipeline."""
+    """Run the bounded agent planning pipeline.
+
+    The LLM analyzes the preprocessed base heightfield and proposes
+    bounded enhancement parameters. No geometry-mutating tools are
+    executed during planning — only analysis, mask generation, and
+    plan proposal.
+    """
     if config is None:
         config = AgentConfig()
 
-    analysis_before = analyze_heightmap(raw_heightmap)
-    current_hf = raw_heightmap.copy()
+    analysis_before = analyze_heightmap(base_hf)
+    current_hf = base_hf.copy()
     log: list[dict] = []
     stored_masks: dict = {}
+    all_tool_calls: list[dict] = []
 
     messages = [
         {"role": "user", "content": _build_initial_message(user_intent, analysis_before)}
@@ -127,15 +126,20 @@ def run_agent_pipeline(
         if not tool_calls:
             break
 
+        all_tool_calls.extend(tool_calls)
         tool_results = []
         is_final = False
         for tc in tool_calls:
             hf_new, desc, done = execute_tool(
                 tc["name"], tc.get("input", {}),
-                current_hf, raw_heightmap, analysis_before,
+                current_hf, base_hf, analysis_before,
                 stored_masks=stored_masks,
             )
-            current_hf = hf_new
+            # Planning-only: discard geometry changes from tools,
+            # keep only analysis feedback and mask/plan state
+            if tc["name"] in ("analyze_heightmap", "evaluate_result",
+                              "generate_mask", "mask_apply", "propose_edit_plan"):
+                current_hf = hf_new
             tool_results.append({"tool_use_id": tc["id"], "content": desc})
             if done:
                 is_final = True
@@ -146,42 +150,24 @@ def run_agent_pipeline(
         if is_final:
             break
 
-        check = quick_machinability_check(current_hf)
-        if not check["likely_machinable"]:
-            messages.append({
-                "role": "user",
-                "content": f"Machinability warning: max_slope={check['max_slope_deg']:.1f}deg, "
-                           f"height_range={check['height_range']:.3f}. "
-                           f"Consider reducing operation strengths.",
-            })
+    # Extract bounded parameters from the plan proposal or tool call history
+    plan_params = extract_plan_parameters(all_tool_calls, stored_masks)
 
-        # Anti-flattening guard
-        current_std = float(current_hf.std())
-        original_std = float(raw_heightmap.std())
-        if current_std < 0.06:
-            messages.append({
-                "role": "user",
-                "content": f"FLATTENING DETECTED: height_std={current_std:.4f} is critically low. "
-                           f"The heightmap is nearly flat. STOP all smoothing operations immediately. "
-                           f"Use boost_contrast(gamma>2.0) or enhance_ridges(strength>1.0) to restore features.",
-            })
-        elif current_std < original_std * 0.4:
-            messages.append({
-                "role": "user",
-                "content": f"FEATURE LOSS WARNING: height_std dropped from {original_std:.4f} to {current_std:.4f} "
-                           f"({current_std/original_std*100:.0f}% remaining). "
-                           f"Do NOT apply more smoothing. Use boost_contrast or blend_pattern to add detail back.",
-            })
-
-    analysis_after = analyze_heightmap(current_hf)
-    comparison = compare_analyses(analysis_before, analysis_after)
+    plan = AgentEditPlan(
+        ridge_boost=plan_params.get("ridge_boost", 0.0),
+        contrast_boost=plan_params.get("contrast_boost", 0.0),
+        texture_amount=plan_params.get("texture_amount", 0.0),
+        smoothing_sigma=plan_params.get("smoothing_sigma", 0.0),
+        target_regions=plan_params.get("target_regions", "global"),
+        notes=plan_params.get("notes", []),
+    )
 
     return AgentResult(
-        heightmap=current_hf,
+        plan=plan,
         analysis_before=analysis_before,
-        analysis_after=analysis_after,
+        analysis_after=None,
         iterations_used=min(iteration + 1, config.max_iterations),
-        evaluation_notes=comparison,
+        evaluation_notes=f"Plan extracted: {len(plan.notes)} parameter notes",
         conversation_log=log,
     )
 
@@ -190,19 +176,28 @@ def _build_initial_message(user_intent: str, analysis: HeightmapAnalysis) -> str
     return f"""## User Intent
 "{user_intent}"
 
-## Current Heightmap Analysis
+## Preprocessed Heightmap Analysis (base surface)
 {analysis_to_text(analysis)}
 
-## Baseline Metrics (MUST preserve or improve)
-- height_std: {analysis.height_std:.4f} — do NOT let this drop below {analysis.height_std * 0.5:.4f}
-- roughness: {analysis.roughness:.3f} — do NOT let this drop below {analysis.roughness * 0.5:.3f}
-- height_range: {analysis.height_range:.3f} — do NOT let this drop below {analysis.height_range * 0.5:.3f}
+## Task
+Analyze this preprocessed heightmap and propose bounded enhancement parameters.
+This surface is already machinable. Your job is to suggest improvements
+within safe parameter ranges.
 
-Please plan a sequence of toolkit operations to transform this heightmap
-to match the user's intent. Start with analyze_heightmap, then apply
-3-5 operations, and end with evaluate_result.
+Available tools:
+- analyze_heightmap: read current metrics
+- generate_mask: create spatial masks for regional control
+- evaluate_result: check metrics against intent keywords
+- propose_edit_plan: submit bounded enhancement parameters
 
-REMEMBER: The heightmap already has rich features. Your job is to SHAPE them, not ERASE them."""
+Do NOT call geometry-mutating tools directly. Use propose_edit_plan to
+specify what enhancements to apply. The parameters will be clamped:
+- ridge_boost: 0.0-0.35
+- contrast_boost: 0.0-0.25
+- texture_amount: 0.0-0.10
+- smoothing_sigma: 0.0-1.5
+
+Start with analyze_heightmap, evaluate, then propose_edit_plan."""
 
 
 def _call_llm(messages: list[dict], config: AgentConfig, log: list[dict]) -> dict:

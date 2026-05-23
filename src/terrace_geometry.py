@@ -588,7 +588,12 @@ def heightfield_to_terrace_mesh(
     labels = _quantize(heightfield, n)
 
     # Step 2: Enforce minimum recess width (6 mm hard rule).
+    # Collapse guard: if recess enforcement reduces labels to 1 unique level, revert.
+    labels_before_recess = labels.copy()
     labels = _enforce_min_recess_width(labels, tool_radius_px, n)
+    if len(np.unique(labels)) <= 1 and len(np.unique(labels_before_recess)) > 1:
+        print("[WARN] Recess enforcement collapsed labels to 1 level; reverting to pre-recess labels.")
+        labels = labels_before_recess
 
     # Step 3: Resolve checkerboard saddle points that produce non-manifold edges.
     labels = _resolve_checkerboard(labels)

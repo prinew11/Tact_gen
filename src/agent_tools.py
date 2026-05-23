@@ -82,19 +82,6 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "height_redistribute",
-        "description": "Remap height histogram to uniform/gaussian/bimodal.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_distribution": {"type": "string", "enum": ["uniform", "gaussian", "bimodal"]},
-                "center": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "width": {"type": "number", "minimum": 0.05, "maximum": 0.5},
-            },
-            "required": ["target_distribution"],
-        },
-    },
-    {
         "name": "directional_warp",
         "description": "Sinusoidal contour bending for flowing ridges effect.",
         "input_schema": {
@@ -162,41 +149,11 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "blend_two",
-        "description": "Blend original and transformed heightmaps.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "alpha": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "blend_mode": {"type": "string", "enum": ["linear", "multiply", "screen"]},
-            },
-            "required": ["alpha"],
-        },
-    },
-    {
         "name": "mask_apply",
         "description": "Apply modifications only within a feathered mask. Use generate_mask first to create a mask.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "feather_px": {"type": "number", "minimum": 0.0, "maximum": 64.0},
-            },
-            "required": [],
-        },
-    },
-    # ── Creative Freedom Tools ──────────────────────────────────────────────
-    {
-        "name": "replace_region",
-        "description": "Replace a region with a flat value. Create plateaus, pits, or flat zones.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_value": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "shape": {"type": "string", "enum": ["ellipse", "rectangle", "diamond"]},
-                "center_x": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "center_y": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "size_x": {"type": "number", "minimum": 0.05, "maximum": 1.0},
-                "size_y": {"type": "number", "minimum": 0.05, "maximum": 1.0},
                 "feather_px": {"type": "number", "minimum": 0.0, "maximum": 64.0},
             },
             "required": [],
@@ -232,51 +189,6 @@ TOOL_SCHEMAS = [
                 "blend_width": {"type": "number", "minimum": 0.01, "maximum": 0.3},
             },
             "required": [],
-        },
-    },
-    {
-        "name": "surface_warp",
-        "description": "Large-scale deformation via control points. List of (x, y, delta, radius).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "control_points": {
-                    "type": "array",
-                    "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                    },
-                },
-            },
-            "required": ["control_points"],
-        },
-    },
-    {
-        "name": "procedural_generate",
-        "description": "Generate a standalone procedural pattern. Use with blend_two to mix into heightmap.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern_type": {"type": "string", "enum": ["perlin", "voronoi", "brick", "hex_grid"]},
-                "size": {"type": "integer", "minimum": 64, "maximum": 1024},
-                "frequency": {"type": "number", "minimum": 1.0, "maximum": 32.0},
-                "amplitude": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "seed": {"type": "integer", "minimum": 0},
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "symmetry_apply",
-        "description": "Apply symmetry: mirror or tile the heightmap.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "axis": {"type": "string", "enum": ["x", "y", "xy", "tile_quadrant"]},
-            },
-            "required": ["axis"],
         },
     },
     # ── Frequency-Aware Tools ───────────────────────────────────────────────
@@ -345,7 +257,48 @@ TOOL_SCHEMAS = [
             "required": ["summary"],
         },
     },
+    {
+        "name": "propose_edit_plan",
+        "description": "Propose bounded enhancement parameters for the preprocessed heightmap. "
+                       "All values are clamped to safe ranges before application.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ridge_boost": {
+                    "type": "number",
+                    "description": "Ridge enhancement strength, 0.0 to 0.35",
+                },
+                "contrast_boost": {
+                    "type": "number",
+                    "description": "Contrast boost amount, 0.0 to 0.25",
+                },
+                "texture_amount": {
+                    "type": "number",
+                    "description": "Texture overlay intensity, 0.0 to 0.10",
+                },
+                "smoothing_sigma": {
+                    "type": "number",
+                    "description": "Smoothing sigma, 0.0 to 1.5",
+                },
+                "target_regions": {
+                    "type": "string",
+                    "description": "Which regions to enhance: 'global', 'ridges', 'valleys', 'high', 'low'",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief summary of the enhancement plan",
+                },
+            },
+            "required": ["summary"],
+        },
+    },
 ]
+
+
+_DANGEROUS_TOOLS = frozenset({
+    "procedural_generate", "blend_two", "surface_warp",
+    "height_redistribute", "replace_region", "symmetry_apply",
+})
 
 
 def execute_tool(
@@ -359,6 +312,10 @@ def execute_tool(
     """Execute a toolkit operation. Returns (heightmap, description, is_final)."""
     if stored_masks is None:
         stored_masks = {}
+
+    # Reject dangerous tools with explicit warning
+    if tool_name in _DANGEROUS_TOOLS:
+        return current_hf, f"REJECTED: {tool_name} is not permitted in bounded mode. Use propose_edit_plan.", False
 
     if tool_name == "analyze_heightmap":
         report = analyze_heightmap(current_hf)
@@ -384,10 +341,6 @@ def execute_tool(
         result = htk.height_selective_transform(current_hf, **tool_input)
         return result, f"Applied height_selective_transform({tool_input})", False
 
-    elif tool_name == "height_redistribute":
-        result = htk.height_redistribute(current_hf, **tool_input)
-        return result, f"Applied height_redistribute({tool_input})", False
-
     elif tool_name == "directional_warp":
         result = htk.directional_warp(current_hf, **tool_input)
         return result, f"Applied directional_warp({tool_input})", False
@@ -408,20 +361,17 @@ def execute_tool(
         result = htk.texture_overlay(current_hf, **tool_input)
         return result, f"Applied texture_overlay({tool_input})", False
 
-    elif tool_name == "blend_two":
-        result = htk.blend_two(original_hf, current_hf, **tool_input)
-        return result, f"Applied blend_two(original, current, {tool_input})", False
-
     elif tool_name == "mask_apply":
-        mask = stored_masks.get("last", np.ones(current_hf.shape, dtype=np.float32))
+        if "last" not in stored_masks:
+            raise ValueError(
+                "mask_apply requires a stored mask. Call generate_mask first. "
+                "Global fallback is not permitted."
+            )
+        mask = stored_masks["last"]
         result = htk.mask_apply(original_hf, current_hf, mask, **tool_input)
-        return result, f"Applied mask_apply(feather={tool_input.get('feather_px', 8.0)}, mask={'stored' if 'last' in stored_masks else 'default'})", False
+        return result, f"Applied mask_apply(feather={tool_input.get('feather_px', 8.0)}, mask=stored)", False
 
-    # ── Creative Freedom Tools ──────────────────────────────────────────────
-    elif tool_name == "replace_region":
-        result = htk.replace_region(current_hf, **tool_input)
-        return result, f"Applied replace_region({tool_input})", False
-
+    # ── Mask Tools ──────────────────────────────────────────────────────────
     elif tool_name == "generate_mask":
         mask = htk.generate_mask(**tool_input)
         stored_masks["last"] = mask
@@ -430,19 +380,6 @@ def execute_tool(
     elif tool_name == "height_zone_remap":
         result = htk.height_zone_remap(current_hf, **tool_input)
         return result, f"Applied height_zone_remap({tool_input})", False
-
-    elif tool_name == "surface_warp":
-        cps = tool_input.get("control_points", [])
-        result = htk.surface_warp(current_hf, control_points=[tuple(cp) for cp in cps])
-        return result, f"Applied surface_warp({len(cps)} control points)", False
-
-    elif tool_name == "procedural_generate":
-        result = htk.procedural_generate(**tool_input)
-        return result, f"Generated procedural pattern: {tool_input.get('pattern_type', 'perlin')}", False
-
-    elif tool_name == "symmetry_apply":
-        result = htk.symmetry_apply(current_hf, **tool_input)
-        return result, f"Applied symmetry_apply(axis={tool_input.get('axis', 'x')})", False
 
     # ── Frequency-Aware Tools ───────────────────────────────────────────────
     elif tool_name == "freq_preserve_lowpass":
@@ -468,6 +405,18 @@ def execute_tool(
     elif tool_name == "accept_heightmap":
         summary = tool_input.get("summary", "Accepted")
         return current_hf, f"Accepted: {summary}", True
+
+    elif tool_name == "propose_edit_plan":
+        summary = tool_input.get("summary", "Plan proposed")
+        stored_masks["_plan_proposal"] = {
+            "ridge_boost": tool_input.get("ridge_boost", 0.0),
+            "contrast_boost": tool_input.get("contrast_boost", 0.0),
+            "texture_amount": tool_input.get("texture_amount", 0.0),
+            "smoothing_sigma": tool_input.get("smoothing_sigma", 0.0),
+            "target_regions": tool_input.get("target_regions", "global"),
+            "summary": summary,
+        }
+        return current_hf, f"Plan proposed: {summary}", True
 
     else:
         return current_hf, f"Unknown tool: {tool_name}", False
@@ -511,3 +460,78 @@ def quick_machinability_check(hf: np.ndarray) -> dict:
         "height_range": height_range,
         "likely_machinable": max_slope < 80 and height_range > 0.1,
     }
+
+
+def extract_plan_parameters(
+    tool_calls: list[dict],
+    stored_masks: dict,
+) -> dict:
+    """Extract bounded edit parameters from tool calls and stored state.
+
+    Primary path: read from stored_masks["_plan_proposal"] if propose_edit_plan was called.
+    Fallback: scan tool calls for parameter values.
+
+    Returns dict with keys: ridge_boost, contrast_boost, texture_amount,
+    smoothing_sigma, target_regions, notes.
+    """
+    # Safe ranges
+    CLAMP = {
+        "ridge_boost": (0.0, 0.35),
+        "contrast_boost": (0.0, 0.25),
+        "texture_amount": (0.0, 0.10),
+        "smoothing_sigma": (0.0, 1.5),
+    }
+
+    plan: dict = {
+        "ridge_boost": 0.0,
+        "contrast_boost": 0.0,
+        "texture_amount": 0.0,
+        "smoothing_sigma": 0.0,
+        "target_regions": "global",
+        "notes": [],
+    }
+
+    # Primary: extract from propose_edit_plan if it was called
+    proposal = stored_masks.get("_plan_proposal")
+    if proposal and isinstance(proposal, dict):
+        for key in ("ridge_boost", "contrast_boost", "texture_amount", "smoothing_sigma"):
+            raw = proposal.get(key, 0.0)
+            lo, hi = CLAMP[key]
+            plan[key] = min(max(float(raw), lo), hi)
+        plan["target_regions"] = proposal.get("target_regions", "global")
+        plan["notes"].append(f"Plan from propose_edit_plan: {proposal.get('summary', '')}")
+        return plan
+
+    # Fallback: scan tool calls for parameter values
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        inp = tc.get("input", {})
+
+        if name in _DANGEROUS_TOOLS:
+            plan["notes"].append(f"WARNING: dangerous tool '{name}' was requested but rejected")
+            continue
+
+        if name == "enhance_ridges":
+            raw = inp.get("strength", 0.0)
+            plan["ridge_boost"] = min(max(float(raw) / 10.0, 0.0), 0.35)
+            plan["notes"].append(f"ridge_boost={plan['ridge_boost']:.3f} from enhance_ridges(strength={raw})")
+
+        elif name == "boost_contrast":
+            raw = inp.get("gamma", 1.0)
+            plan["contrast_boost"] = min(max((float(raw) - 1.0) / 8.0, 0.0), 0.25)
+            plan["notes"].append(f"contrast_boost={plan['contrast_boost']:.3f} from boost_contrast(gamma={raw})")
+
+        elif name in ("texture_overlay", "blend_pattern"):
+            raw = inp.get("amplitude", 0.0)
+            plan["texture_amount"] = min(max(float(raw) * 0.25, 0.0), 0.10)
+            plan["notes"].append(f"texture_amount={plan['texture_amount']:.3f} from {name}(amplitude={raw})")
+
+        elif name in ("bandpass_filter", "freq_preserve_lowpass"):
+            cutoff = inp.get("cutoff", inp.get("high_cutoff", 0.5))
+            plan["smoothing_sigma"] = min(max(float(cutoff) * 3.0, 0.0), 1.5)
+            plan["notes"].append(f"smoothing_sigma={plan['smoothing_sigma']:.3f} from {name}")
+
+        elif name == "generate_mask":
+            plan["notes"].append(f"mask generated: shape={inp.get('shape', 'unknown')}")
+
+    return plan

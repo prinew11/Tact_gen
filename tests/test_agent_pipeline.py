@@ -467,32 +467,30 @@ class TestStoredMasks:
 # ── New Tool Schemas ────────────────────────────────────────────────────────
 
 class TestNewSchemas:
-    def test_new_tool_names_present(self):
+    def test_expected_tool_names_present(self):
         names = {s["name"] for s in TOOL_SCHEMAS}
-        new_tools = [
-            "replace_region", "generate_mask", "height_zone_remap",
-            "surface_warp", "procedural_generate", "symmetry_apply",
+        expected = [
+            "generate_mask", "height_zone_remap",
             "freq_preserve_lowpass", "freq_stepped_convert", "freq_band_boost",
+            "propose_edit_plan",
         ]
-        for tool in new_tools:
+        for tool in expected:
             assert tool in names, f"Missing schema for {tool}"
 
+    def test_dangerous_tools_removed(self):
+        names = {s["name"] for s in TOOL_SCHEMAS}
+        removed = ["replace_region", "surface_warp", "procedural_generate",
+                    "symmetry_apply", "blend_two", "height_redistribute"]
+        for tool in removed:
+            assert tool not in names, f"Removed tool still present: {tool}"
+
     def test_total_schema_count(self):
-        assert len(TOOL_SCHEMAS) == 25
+        assert len(TOOL_SCHEMAS) == 20
 
 
 # ── New Tool Execution ─────────────────────────────────────────────────────
 
 class TestNewToolExecution:
-    def test_replace_region_tool(self, small_hf):
-        analysis = analyze_heightmap(small_hf)
-        hf, desc, done = execute_tool(
-            "replace_region", {"target_value": 0.8, "shape": "ellipse"},
-            small_hf, small_hf, analysis,
-        )
-        assert hf.shape == small_hf.shape
-        assert not done
-
     def test_generate_mask_tool(self, small_hf):
         analysis = analyze_heightmap(small_hf)
         stored = {}
@@ -521,10 +519,291 @@ class TestNewToolExecution:
         assert hf.shape == small_hf.shape
         assert not done
 
-    def test_symmetry_apply_tool(self, small_hf):
+    def test_propose_edit_plan_tool(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        stored = {}
+        hf, desc, done = execute_tool(
+            "propose_edit_plan",
+            {"ridge_boost": 0.2, "contrast_boost": 0.15, "summary": "test plan"},
+            small_hf, small_hf, analysis, stored_masks=stored,
+        )
+        assert done
+        assert "Plan proposed" in desc
+        assert "_plan_proposal" in stored
+        assert stored["_plan_proposal"]["ridge_boost"] == 0.2
+
+
+# ── Mask Reject Global ─────────────────────────────────────────────────────
+
+class TestMaskRejectGlobal:
+    """mask_apply must reject when no mask is stored."""
+
+    def test_mask_apply_no_mask_raises(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        stored_masks = {}
+        with pytest.raises(ValueError, match="requires a stored mask"):
+            execute_tool(
+                "mask_apply", {"feather_px": 8.0},
+                small_hf, small_hf, analysis,
+                stored_masks=stored_masks,
+            )
+
+    def test_mask_apply_with_mask_works(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        stored_masks = {}
+        execute_tool(
+            "generate_mask", {"shape": "ellipse", "resolution": 64},
+            small_hf, small_hf, analysis,
+            stored_masks=stored_masks,
+        )
+        hf, desc, done = execute_tool(
+            "mask_apply", {"feather_px": 8.0},
+            small_hf, small_hf, analysis,
+            stored_masks=stored_masks,
+        )
+        assert hf.shape == small_hf.shape
+
+
+# ── Dangerous Tool Rejection ───────────────────────────────────────────────
+
+class TestDangerousToolRejection:
+    """Dangerous tools must be rejected with a warning."""
+
+    def test_procedural_generate_rejected(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        hf, desc, done = execute_tool(
+            "procedural_generate", {"pattern_type": "perlin"},
+            small_hf, small_hf, analysis,
+        )
+        assert "REJECTED" in desc
+        assert hf.shape == small_hf.shape
+        assert not done
+
+    def test_blend_two_rejected(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        hf, desc, done = execute_tool(
+            "blend_two", {"alpha": 0.5},
+            small_hf, small_hf, analysis,
+        )
+        assert "REJECTED" in desc
+
+    def test_surface_warp_rejected(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        hf, desc, done = execute_tool(
+            "surface_warp", {"control_points": []},
+            small_hf, small_hf, analysis,
+        )
+        assert "REJECTED" in desc
+
+    def test_symmetry_apply_rejected(self, small_hf):
         analysis = analyze_heightmap(small_hf)
         hf, desc, done = execute_tool(
             "symmetry_apply", {"axis": "x"},
             small_hf, small_hf, analysis,
         )
-        assert hf.shape == small_hf.shape
+        assert "REJECTED" in desc
+
+    def test_replace_region_rejected(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        hf, desc, done = execute_tool(
+            "replace_region", {"target_value": 0.5},
+            small_hf, small_hf, analysis,
+        )
+        assert "REJECTED" in desc
+
+    def test_height_redistribute_rejected(self, small_hf):
+        analysis = analyze_heightmap(small_hf)
+        hf, desc, done = execute_tool(
+            "height_redistribute", {"target_distribution": "uniform"},
+            small_hf, small_hf, analysis,
+        )
+        assert "REJECTED" in desc
+
+
+# ── Extract Plan Parameters ────────────────────────────────────────────────
+
+class TestExtractPlanParameters:
+    def test_empty_calls(self):
+        from agent_tools import extract_plan_parameters
+        params = extract_plan_parameters([], {})
+        assert params["ridge_boost"] == 0.0
+        assert params["contrast_boost"] == 0.0
+        assert params["texture_amount"] == 0.0
+
+    def test_extracts_from_proposal(self):
+        from agent_tools import extract_plan_parameters
+        stored = {"_plan_proposal": {
+            "ridge_boost": 0.25,
+            "contrast_boost": 0.15,
+            "texture_amount": 0.08,
+            "smoothing_sigma": 0.5,
+            "target_regions": "ridges",
+            "summary": "test",
+        }}
+        params = extract_plan_parameters([], stored)
+        assert params["ridge_boost"] == 0.25
+        assert params["contrast_boost"] == 0.15
+        assert params["texture_amount"] == 0.08
+        assert params["target_regions"] == "ridges"
+
+    def test_clamps_values(self):
+        from agent_tools import extract_plan_parameters
+        stored = {"_plan_proposal": {
+            "ridge_boost": 100.0,
+            "contrast_boost": -5.0,
+            "texture_amount": 0.5,
+            "smoothing_sigma": -1.0,
+            "summary": "out of range",
+        }}
+        params = extract_plan_parameters([], stored)
+        assert params["ridge_boost"] == 0.35
+        assert params["contrast_boost"] == 0.0
+        assert params["texture_amount"] == 0.10
+        assert params["smoothing_sigma"] == 0.0
+
+    def test_dangerous_tool_calls_produce_warnings(self):
+        from agent_tools import extract_plan_parameters
+        calls = [
+            {"name": "procedural_generate", "input": {"pattern_type": "perlin"}},
+            {"name": "enhance_ridges", "input": {"strength": 2.0}},
+        ]
+        params = extract_plan_parameters(calls, {})
+        assert any("WARNING" in n for n in params["notes"])
+        assert params["ridge_boost"] > 0  # enhance_ridges still extracted
+
+
+# ── Apply Agent Plan ───────────────────────────────────────────────────────
+
+class TestApplyAgentPlan:
+    def test_identity_plan(self, small_hf):
+        from pipeline import apply_agent_plan
+        from agent_planner import AgentEditPlan
+        plan = AgentEditPlan()
+        result = apply_agent_plan(small_hf, small_hf, plan)
+        np.testing.assert_allclose(result, small_hf, atol=0.01)
+
+    def test_plan_clamps_values(self, small_hf):
+        from pipeline import apply_agent_plan
+        from agent_planner import AgentEditPlan
+        plan = AgentEditPlan(ridge_boost=100.0, contrast_boost=-5.0)
+        result = apply_agent_plan(small_hf, small_hf, plan)
+        assert result.shape == small_hf.shape
+        assert 0.0 <= result.min() and result.max() <= 1.0
+
+    def test_plan_alpha_bounded(self, small_hf):
+        from pipeline import apply_agent_plan
+        from agent_planner import AgentEditPlan
+        plan = AgentEditPlan(ridge_boost=0.35, contrast_boost=0.25)
+        result = apply_agent_plan(small_hf, small_hf, plan, alpha=0.35)
+        diff = np.abs(result - small_hf).mean()
+        assert diff < 0.35
+
+    def test_target_regions_ridges(self, small_hf):
+        from pipeline import apply_agent_plan
+        from agent_planner import AgentEditPlan
+        plan = AgentEditPlan(ridge_boost=0.2, target_regions="ridges")
+        result = apply_agent_plan(small_hf, small_hf, plan)
+        assert result.shape == small_hf.shape
+        assert 0.0 <= result.min() and result.max() <= 1.0
+
+
+# ── Validate Agent Modified ────────────────────────────────────────────────
+
+class TestValidateAgentModified:
+    def test_flat_rejected(self):
+        from pipeline import validate_agent_modified_heightfield
+        base = np.random.rand(64, 64).astype(np.float32) * 0.5 + 0.25
+        flat = np.full((64, 64), 0.5, dtype=np.float32)
+        accepted, reason = validate_agent_modified_heightfield(base, flat)
+        assert not accepted
+        assert "flat" in reason.lower()
+
+    def test_similar_accepted(self, small_hf):
+        from pipeline import validate_agent_modified_heightfield
+        modified = small_hf + np.random.default_rng(0).normal(0, 0.01, small_hf.shape).astype(np.float32)
+        modified = np.clip(modified, 0, 1)
+        accepted, reason = validate_agent_modified_heightfield(small_hf, modified)
+        assert accepted
+
+    def test_drastic_change_rejected(self, small_hf):
+        from pipeline import validate_agent_modified_heightfield
+        modified = small_hf * 0.01
+        accepted, reason = validate_agent_modified_heightfield(small_hf, modified)
+        assert not accepted
+
+    def test_label_collapse_rejected(self):
+        from pipeline import validate_agent_modified_heightfield
+        base = np.random.rand(64, 64).astype(np.float32)
+        modified = np.full((64, 64), 0.99, dtype=np.float32)  # all same value -> 1 label
+        accepted, reason = validate_agent_modified_heightfield(base, modified)
+        assert not accepted
+        assert "label" in reason.lower() or "flat" in reason.lower()
+
+
+# ── Recess Collapse Regression ─────────────────────────────────────────────
+
+class TestRecessCollapseRegression:
+    """Quantized labels must not collapse to 1 level after recess enforcement."""
+
+    def test_recess_enforcement_no_collapse(self):
+        from terrace_geometry import _enforce_min_recess_width
+        labels = np.zeros((64, 64), dtype=np.int32)
+        labels[:16, :] = 6
+        labels[16:32, :] = 7
+        labels[32:48, ] = 8
+        labels[48:, :] = 9
+        tool_radius_px = 3.0
+        result = _enforce_min_recess_width(labels.copy(), tool_radius_px, n_levels=10)
+        unique = np.unique(result)
+        assert len(unique) > 1, f"Labels collapsed to {unique}"
+
+    def test_heightfield_to_terrace_mesh_collapse_guard(self):
+        """Even if recess would collapse, the mesh builder reverts."""
+        from terrace_geometry import heightfield_to_terrace_mesh, TerraceConfig
+        # Create a heightfield with distinct levels
+        hf = np.zeros((64, 64), dtype=np.float32)
+        hf[:16, :] = 0.2
+        hf[16:32, :] = 0.4
+        hf[32:48, :] = 0.6
+        hf[48:, :] = 0.8
+        tc = TerraceConfig(
+            physical_size_mm=50.0,
+            max_height_mm=5.0,
+            terrace_steps=4,
+            tool_diameter_mm=6.0,
+            mesh_resolution=64,
+        )
+        mesh, report = heightfield_to_terrace_mesh(hf, tc)
+        # Mesh should have multiple levels, not collapse to 1
+        assert report.levels_used >= 2
+
+
+# ── Terrace Quantization Normalization ─────────────────────────────────────
+
+class TestNormalizeForTerraceQuantize:
+    def test_expands_compressed_range(self):
+        from pipeline import normalize_for_terrace_quantize
+        hf = np.random.default_rng(0).uniform(0.45, 0.85, (64, 64)).astype(np.float32)
+        result = normalize_for_terrace_quantize(hf)
+        assert result.max() - result.min() > 0.5
+        labels = np.floor(np.clip(result, 0, 0.999) * 12).astype(np.int32)
+        assert len(np.unique(labels)) >= 8
+
+    def test_already_full_range_unchanged(self):
+        from pipeline import normalize_for_terrace_quantize
+        hf = np.random.default_rng(0).uniform(0.0, 1.0, (64, 64)).astype(np.float32)
+        result = normalize_for_terrace_quantize(hf)
+        np.testing.assert_allclose(result, hf, atol=0.05)
+
+    def test_flat_returns_constant(self):
+        from pipeline import normalize_for_terrace_quantize
+        hf = np.full((64, 64), 0.5, dtype=np.float32)
+        result = normalize_for_terrace_quantize(hf)
+        assert result.std() < 0.01
+
+    def test_preserves_margin(self):
+        from pipeline import normalize_for_terrace_quantize
+        hf = np.random.default_rng(0).uniform(0.45, 0.85, (64, 64)).astype(np.float32)
+        result = normalize_for_terrace_quantize(hf, preserve_margin=0.02)
+        assert result.min() >= 0.019
+        assert result.max() <= 0.981

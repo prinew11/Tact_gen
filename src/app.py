@@ -450,7 +450,7 @@ def run_agent_transform(
     max_iterations: int,
     diffusion_steps: int,
 ):
-    """Run the agent pipeline: image -> diffusion -> agent transform -> terrace STL."""
+    """Run the agent pipeline: image -> diffusion -> preprocess -> agent plan -> validate -> terrace STL."""
     if image is None:
         raise gr.Error("Upload an image.")
     if not user_intent.strip():
@@ -458,10 +458,12 @@ def run_agent_transform(
     try:
         import cv2
         from agent_planner import run_agent_pipeline, AgentConfig
-        from heightmap_analyzer import analysis_to_text, compare_analyses, analysis_to_json
+        from heightmap_analyzer import analysis_to_text, analysis_to_json
         from diffusion_pipeline import DiffusionConfig, generate_heightfield
+        from pipeline import apply_agent_plan, validate_agent_modified_heightfield, normalize_for_terrace_quantize
         from terrace_geometry import (
             TerraceConfig,
+            preprocess_for_terrace,
             heightfield_to_terrace_mesh,
             save_stl,
         )
@@ -472,35 +474,57 @@ def run_agent_transform(
         raw_hf = generate_heightfield(rgb, diff_config)
 
         t0 = time.time()
+
+        # Terrace config (shared between preprocess and mesh generation)
+        tc = TerraceConfig(
+            physical_size_mm=100.0,
+            max_height_mm=20.0,
+            tool_diameter_mm=6.0,
+            terrace_steps=12,
+        )
+
+        # Preprocess FIRST — produces stable base heightfield
+        base_hf = preprocess_for_terrace(
+            raw_hf,
+            tool_diameter_mm=tc.tool_diameter_mm,
+            physical_size_mm=tc.physical_size_mm,
+        )
+
+        # Agent planning — returns bounded parameters, NOT a heightfield
         agent_config = AgentConfig(
             model=model,
             max_iterations=int(max_iterations),
             api_key=api_key.strip(),
             base_url=base_url.strip(),
         )
-        result = run_agent_pipeline(raw_hf, user_intent, agent_config)
+        result = run_agent_pipeline(base_hf, raw_hf, user_intent, agent_config)
 
-        # Convert agent output to terrace STL
-        # Skip preprocess_for_terrace — agent output already has clean features.
-        # Pass directly to heightfield_to_terrace_mesh which handles quantization
-        # and min-recess enforcement internally.
+        # Apply bounded plan to base
+        modified_hf = apply_agent_plan(base_hf, raw_hf, result.plan)
+
+        # Validate against base
+        accepted, reason = validate_agent_modified_heightfield(base_hf, modified_hf)
+        agent_hf = modified_hf if accepted else base_hf
+
+        # Normalize for terrace quantization (expands range for more visible levels)
+        terrace_hf = normalize_for_terrace_quantize(agent_hf, p_low=1.0, p_high=99.0, preserve_margin=0.02)
+
+        # Generate terrace mesh
+        mesh, _report = heightfield_to_terrace_mesh(terrace_hf, tc)
+
         agent_dir = OUT / "agent_run"
         agent_dir.mkdir(parents=True, exist_ok=True)
-        np.save(str(agent_dir / "heightfield_agent.npy"), result.heightmap)
-
-        # Normalize to [0,1] and mild morphology only (no aggressive pruning)
-        agent_hf = np.clip(result.heightmap, 0.0, 1.0).astype(np.float32)
-
-        tc = TerraceConfig(
-            physical_size_mm=50.0,
-            max_height_mm=5.0,
-            tool_diameter_mm=6.0,
-            terrace_steps=10,
-        )
-        mesh, _report = heightfield_to_terrace_mesh(agent_hf, tc)
         stl_path = agent_dir / "terrace.stl"
         save_stl(mesh, stl_path)
 
+        np.save(str(agent_dir / "heightfield_base.npy"), base_hf)
+        np.save(str(agent_dir / "heightfield_modified.npy"), modified_hf)
+        np.save(str(agent_dir / "heightfield_final.npy"), agent_hf)
+        np.save(str(agent_dir / "heightfield_terrace_input.npy"), terrace_hf)
+
+        # Save analysis
+        from heightmap_analyzer import analyze_heightmap as _analyze
+        result.analysis_after = _analyze(agent_hf)
         (agent_dir / "analysis_before.json").write_text(
             analysis_to_json(result.analysis_before)
         )
@@ -510,10 +534,9 @@ def run_agent_transform(
 
         elapsed = time.time() - t0
 
-        # Build before/after comparison
+        # Build info
         before_text = analysis_to_text(result.analysis_before)
-        after_text = analysis_to_text(result.analysis_after)
-        comparison = compare_analyses(result.analysis_before, result.analysis_after)
+        plan = result.plan
 
         log_lines = []
         for entry in result.conversation_log:
@@ -524,24 +547,29 @@ def run_agent_transform(
                     elif item.get("type") == "tool_use":
                         log_lines.append(f"**Tool**: `{item['name']}`({json.dumps(item.get('input', {}))[:100]})")
 
-        stl_preview = _render_heightmap_3d(agent_hf, 50.0, 5.0, title="Agent Terrace")
+        stl_preview = _render_heightmap_3d(agent_hf, tc.physical_size_mm, tc.max_height_mm, title="Agent Terrace")
 
         info = (
             f"**Agent Transform done** ({elapsed:.1f}s)\n\n"
             f"- Intent: \"{user_intent}\"\n"
             f"- Model: {model}\n"
             f"- Iterations used: {result.iterations_used}\n"
+            f"- Validation: {'ACCEPTED' if accepted else 'REJECTED (fallback to base)'}: {reason}\n"
             f"- STL saved: `{stl_path.relative_to(ROOT)}`\n\n"
-            f"---\n\n"
+            f"### Edit Plan\n"
+            f"- ridge_boost: {plan.ridge_boost:.3f}\n"
+            f"- contrast_boost: {plan.contrast_boost:.3f}\n"
+            f"- texture_amount: {plan.texture_amount:.3f}\n"
+            f"- smoothing_sigma: {plan.smoothing_sigma:.3f}\n"
+            f"- target_regions: {plan.target_regions}\n"
+            f"- preserve_large_structures: {plan.preserve_large_structures}\n\n"
             f"### Before Analysis\n{before_text}\n\n"
-            f"### After Analysis\n{after_text}\n\n"
-            f"### Comparison\n{comparison}\n\n"
             f"### Evaluation\n{result.evaluation_notes}"
         )
         if log_lines:
             info += "\n\n### Agent Log\n" + "\n".join(f"- {l}" for l in log_lines[:20])
 
-        return _arr_to_uint8(raw_hf), _arr_to_uint8(result.heightmap), stl_preview, info
+        return _arr_to_uint8(base_hf), _arr_to_uint8(agent_hf), stl_preview, info
 
     except Exception as e:
         raise gr.Error(f"Agent transform failed: {e}")
