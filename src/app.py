@@ -580,20 +580,15 @@ def run_agent_transform(
             f"- Iterations used: {result.iterations_used}\n"
             f"- Validation: {'ACCEPTED' if accepted else 'REJECTED (fallback to base)'}: {reason}\n"
             f"- STL saved: `{stl_path.relative_to(ROOT)}`\n\n"
-            f"### Edit Plan\n"
-            f"- ridge_boost: {plan.ridge_boost:.3f}\n"
-            f"- contrast_boost: {plan.contrast_boost:.3f}\n"
-            f"- texture_amount: {plan.texture_amount:.3f}\n"
-            f"- smoothing_sigma: {plan.smoothing_sigma:.3f}\n"
-            f"- target_regions: {plan.target_regions}\n"
-            f"- preserve_large_structures: {plan.preserve_large_structures}\n"
+            f"### Creative Plan\n"
+            f"- Operations applied: {len(plan.operations)}\n"
+            f"- Topology preserved: {plan.topology_preserved}\n"
+            f"- Reasoning: {plan.reasoning}\n"
         )
-        if plan.directional_step_angle_deg is not None:
-            info += (
-                f"- **directional_step**: angle={plan.directional_step_angle_deg:.1f}deg, "
-                f"n_steps={plan.directional_step_n_steps or 8}, "
-                f"mask={'region_b' if plan.directional_step_use_region_mask else 'none'}\n"
-            )
+        if plan.operations:
+            info += "\n**Operations:**\n"
+            for i, op in enumerate(plan.operations, 1):
+                info += f"  {i}. {op.get('tool', 'unknown')}\n"
         info += (
             f"\n### Before Analysis\n{before_text}\n\n"
             f"### Evaluation\n{result.evaluation_notes}"
