@@ -111,99 +111,14 @@ def apply_agent_plan(
     plan: AgentEditPlan,
     alpha: float = 0.35,
 ) -> np.ndarray:
-    """Apply bounded edit plan to the base heightfield.
+    """Fallback: return base_hf unchanged.
 
-    Clamps all plan values to safe ranges, builds a bounded candidate,
-    and alpha-blends against the stable base.
-
-    Args:
-        base_hf: Preprocessed stable heightfield (source of truth).
-        raw_hf: Original raw heightfield (for reference only).
-        plan: AgentEditPlan with bounded parameters.
-        alpha: Maximum blend factor. Default 0.35.
-
-    Returns:
-        Modified heightfield as float32 [0, 1].
+    In creative mode, the agent directly transforms the heightmap via tools
+    and returns the result in AgentResult.final_hf. This function only
+    serves as a fallback when the agent fails to produce a result.
     """
-    import heightmap_toolkit as htk
-
-    alpha = min(max(alpha, 0.0), 0.35)
-
-    # Clamp plan values
-    ridge_boost = min(max(plan.ridge_boost, 0.0), 0.35)
-    contrast_boost = min(max(plan.contrast_boost, 0.0), 0.25)
-    texture_amount = min(max(plan.texture_amount, 0.0), 0.10)
-    smoothing_sigma = min(max(plan.smoothing_sigma, 0.0), 1.5)
-
-    logger.info(
-        "apply_agent_plan: ridge=%.3f contrast=%.3f texture=%.3f smooth=%.3f alpha=%.2f target=%s",
-        ridge_boost, contrast_boost, texture_amount, smoothing_sigma, alpha, plan.target_regions,
-    )
-
-    # Build candidate by applying bounded modifications to base_hf
-    candidate = base_hf.copy()
-
-    # Generate target region mask
-    region_mask = _build_region_mask(base_hf, plan.target_regions)
-
-    # 1. Ridge enhancement (scale strength to toolkit range)
-    if ridge_boost > 0.001:
-        toolkit_strength = ridge_boost * 10.0  # map [0,0.35] -> [0,3.5]
-        candidate = htk.enhance_ridges(candidate, strength=toolkit_strength)
-
-    # 2. Contrast boost (scale to gamma range)
-    if contrast_boost > 0.001:
-        gamma = 1.0 + contrast_boost * 8.0  # map [0,0.25] -> [1.0,3.0]
-        candidate = htk.boost_contrast(candidate, gamma=gamma)
-
-    # 3. Texture overlay
-    if texture_amount > 0.001:
-        toolkit_amp = texture_amount * 4.0  # map [0,0.10] -> [0,0.40]
-        candidate = htk.texture_overlay(candidate, amplitude=toolkit_amp)
-
-    # 4. Smoothing (mild gaussian)
-    if smoothing_sigma > 0.01:
-        from scipy.ndimage import gaussian_filter
-        candidate = gaussian_filter(candidate, sigma=smoothing_sigma)
-        candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
-
-    # 4b. Directional step conversion for Type B regions (if agent requested it)
-    if plan.directional_step_angle_deg is not None:
-        import heightmap_toolkit as htk
-        from heightmap_analyzer import analyze_heightmap as _analyze
-        # Re-analyze to get the region mask on the current candidate
-        cand_analysis = _analyze(candidate)
-        ds_mask = cand_analysis.region_b_mask if plan.directional_step_use_region_mask else None
-        candidate = htk.directional_step_convert(
-            candidate,
-            angle_deg=plan.directional_step_angle_deg,
-            n_steps=plan.directional_step_n_steps or 8,
-            mask=ds_mask,
-            feather_px=12.0,
-        )
-        logger.info(
-            "apply_agent_plan: directional_step_convert applied (angle=%.1f, n_steps=%s, mask=%s)",
-            plan.directional_step_angle_deg,
-            plan.directional_step_n_steps or 8,
-            "region_b" if ds_mask is not None else "none",
-        )
-
-    # 5. Apply region mask: modifications only where mask is active
-    if region_mask is not None:
-        candidate = base_hf * (1.0 - region_mask) + candidate * region_mask
-
-    # 6. Alpha blend against base
-    final = (1.0 - alpha) * base_hf + alpha * candidate
-
-    # 7. Clip to [0, 1]
-    final = np.clip(final, 0.0, 1.0).astype(np.float32)
-
-    logger.info(
-        "apply_agent_plan result: min=%.4f max=%.4f std=%.4f mean=%.4f",
-        float(final.min()), float(final.max()), float(final.std()), float(final.mean()),
-    )
-
-    return final
+    logger.info("apply_agent_plan: creative mode fallback, returning base_hf unchanged")
+    return base_hf.copy()
 
 
 def _build_region_mask(hf: np.ndarray, target_regions: str) -> np.ndarray | None:
@@ -239,24 +154,22 @@ def _build_region_mask(hf: np.ndarray, target_regions: str) -> np.ndarray | None
 def validate_agent_modified_heightfield(
     base_hf: np.ndarray,
     modified_hf: np.ndarray,
-    std_min: float = 0.04,
-    std_change_max: float = 1.5,
+    std_min: float = 0.05,
     min_unique_labels: int = 3,
+    grad_ratio_max: float = 6.0,
 ) -> tuple[bool, str]:
     """Validate that the agent-modified heightfield is safe for terrace meshing.
 
-    All checks are relative to base_hf.
+    Simplified validation for creative mode — only checks hard CNC constraints.
 
     Returns:
         (accepted, reason) tuple.
     """
-    base_std = float(base_hf.std())
     mod_std = float(modified_hf.std())
 
     logger.info(
-        "validate: base_std=%.4f mod_std=%.4f base_range=%.4f mod_range=%.4f",
-        base_std, mod_std,
-        float(base_hf.max() - base_hf.min()),
+        "validate: mod_std=%.4f mod_range=%.4f",
+        mod_std,
         float(modified_hf.max() - modified_hf.min()),
     )
 
@@ -266,18 +179,7 @@ def validate_agent_modified_heightfield(
         logger.warning(reason)
         return False, reason
 
-    # Check 2: Std change not too drastic (relative to base)
-    if base_std > 1e-6:
-        std_ratio = abs(mod_std - base_std) / base_std
-        if std_ratio > std_change_max:
-            reason = (
-                f"REJECT: std change too drastic "
-                f"({base_std:.4f} -> {mod_std:.4f}, ratio={std_ratio:.2f} > {std_change_max})"
-            )
-            logger.warning(reason)
-            return False, reason
-
-    # Check 3: No label collapse (quantize to 8 levels, check unique count)
+    # Check 2: No label collapse (quantize to 8 levels, check unique count)
     labels = np.floor(np.clip(modified_hf, 0, 0.999) * 8).astype(np.int32)
     n_unique = len(np.unique(labels))
     if n_unique < min_unique_labels:
@@ -285,35 +187,7 @@ def validate_agent_modified_heightfield(
         logger.warning(reason)
         return False, reason
 
-    # Check 4: No excessive tiny components (relative to base)
-    import cv2
-    base_labels = np.floor(np.clip(base_hf, 0, 0.999) * 8).astype(np.int32)
-    for level in range(1, 8):
-        mod_mask = (labels == level).astype(np.uint8)
-        base_mask = (base_labels == level).astype(np.uint8)
-        if mod_mask.sum() == 0:
-            continue
-        total_pixels = mod_mask.size
-        tiny_threshold = total_pixels * 0.001
-
-        # Count tiny components in modified
-        n_comp_mod, _, stats_mod, _ = cv2.connectedComponentsWithStats(mod_mask)
-        tiny_mod = sum(1 for i in range(1, n_comp_mod) if stats_mod[i, cv2.CC_STAT_AREA] < tiny_threshold)
-
-        # Count tiny components in base
-        n_comp_base, _, stats_base, _ = cv2.connectedComponentsWithStats(base_mask)
-        tiny_base = sum(1 for i in range(1, n_comp_base) if stats_base[i, cv2.CC_STAT_AREA] < tiny_threshold)
-
-        # Reject if tiny components increased by more than 50% relative to base
-        if tiny_mod > max(tiny_base * 1.5, tiny_base + 10):
-            reason = (
-                f"REJECT: excessive tiny components at level {level} "
-                f"({tiny_mod} vs base {tiny_base})"
-            )
-            logger.warning(reason)
-            return False, reason
-
-    # Check 5: High-frequency noise not amplified too much (relative to base)
+    # Check 3: High-frequency noise not amplified too much (relative to base)
     base_gy, base_gx = np.gradient(base_hf)
     mod_gy, mod_gx = np.gradient(modified_hf)
     base_grad_mean = float(np.sqrt(base_gx**2 + base_gy**2).mean())
@@ -321,10 +195,10 @@ def validate_agent_modified_heightfield(
 
     if base_grad_mean > 1e-6:
         grad_ratio = mod_grad_mean / base_grad_mean
-        if grad_ratio > 5.0:
+        if grad_ratio > grad_ratio_max:
             reason = (
                 f"REJECT: high-frequency noise amplified too much "
-                f"(gradient ratio={grad_ratio:.2f}x)"
+                f"(gradient ratio={grad_ratio:.2f}x > {grad_ratio_max})"
             )
             logger.warning(reason)
             return False, reason
@@ -414,7 +288,7 @@ def run_full_pipeline(config: PipelineConfig) -> PipelineResult:
     )
     np.save(out_dir / "heightfield_base.npy", base_hf)
 
-    # 3. Agent planning (agent directly executes tools, returns final_hf)
+    # 3. Agent planning (creative mode — agent directly executes tools)
     agent_config = AgentConfig(
         model=config.agent_model,
         max_iterations=config.agent_max_iterations,
@@ -423,9 +297,19 @@ def run_full_pipeline(config: PipelineConfig) -> PipelineResult:
     gray = np.array(Image.open(config.image_path).convert("L"), dtype=np.float32) / 255.0
     image_gray = cv2.resize(gray, (base_hf.shape[1], base_hf.shape[0]), interpolation=cv2.INTER_AREA)
 
+    # Compute machining constraints for agent
+    constraints = {
+        "tool_diameter_mm": config.tool_diameter_mm,
+        "tool_radius_mm": config.tool_diameter_mm / 2.0,
+        "physical_size_mm": config.physical_size_mm,
+        "max_height_mm": config.max_height_mm,
+        "terrace_steps": config.terrace_steps if config.terrace_steps > 0 else 5,
+    }
+
     agent_result = run_agent_pipeline(
         base_hf, raw_hf, config.user_intent, agent_config,
         image_gray=image_gray,
+        constraints=constraints,
     )
 
     # 4. Use agent's final heightmap if available, otherwise apply plan
@@ -495,8 +379,8 @@ def run_agent_only(
     base_hf = preprocess_for_terrace(raw_hf)
     np.save(out_dir / "heightfield_base.npy", base_hf)
 
-    # Agent planning
-    agent_result = run_agent_pipeline(base_hf, raw_hf, user_intent)
+    # Agent planning (creative mode)
+    agent_result = run_agent_pipeline(base_hf, raw_hf, user_intent, constraints={})
 
     # Use agent's final heightmap if available, otherwise apply plan
     if agent_result.final_hf is not None:
