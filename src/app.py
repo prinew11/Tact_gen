@@ -479,6 +479,15 @@ def run_agent_transform(
 
         t0 = time.time()
 
+        # Image-guided blend: bypass diffusion's weak dynamic range
+        from scipy.ndimage import gaussian_filter as _gf
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        gray_smooth = _gf(gray, sigma=12)
+        def _norm(x):
+            lo, hi = float(x.min()), float(x.max())
+            return (x - lo) / (hi - lo) if hi - lo > 1e-8 else np.full_like(x, 0.5)
+        blended_hf = np.clip(0.8 * _norm(gray_smooth) + 0.2 * _norm(raw_hf), 0.0, 1.0).astype(np.float32)
+
         # Terrace config (shared between preprocess and mesh generation)
         tc = TerraceConfig(
             physical_size_mm=float(physical_size),
@@ -489,22 +498,27 @@ def run_agent_transform(
 
         # Preprocess FIRST — produces stable base heightfield
         base_hf = preprocess_for_terrace(
-            raw_hf,
+            blended_hf,
             tool_diameter_mm=tc.tool_diameter_mm,
             physical_size_mm=tc.physical_size_mm,
         )
 
-        # Agent planning — returns bounded parameters, NOT a heightfield
+        # Agent planning — agent directly executes tools
         agent_config = AgentConfig(
             model=model,
             max_iterations=int(max_iterations),
             api_key=api_key.strip(),
             base_url=base_url.strip(),
         )
-        result = run_agent_pipeline(base_hf, raw_hf, user_intent, agent_config)
+        # Prepare image_gray for image_guided_ridge_restore tool
+        image_gray = cv2.resize(gray, (base_hf.shape[1], base_hf.shape[0]), interpolation=cv2.INTER_AREA)
+        result = run_agent_pipeline(base_hf, raw_hf, user_intent, agent_config, image_gray=image_gray)
 
-        # Apply bounded plan to base
-        modified_hf = apply_agent_plan(base_hf, raw_hf, result.plan)
+        # Use agent's final heightmap if available, otherwise apply plan
+        if result.final_hf is not None:
+            modified_hf = result.final_hf
+        else:
+            modified_hf = apply_agent_plan(base_hf, raw_hf, result.plan)
 
         # Validate against base
         accepted, reason = validate_agent_modified_heightfield(base_hf, modified_hf)
@@ -521,6 +535,7 @@ def run_agent_transform(
         stl_path = agent_dir / "terrace.stl"
         save_stl(mesh, stl_path)
 
+        np.save(str(agent_dir / "heightfield_blended.npy"), blended_hf)
         np.save(str(agent_dir / "heightfield_base.npy"), base_hf)
         np.save(str(agent_dir / "heightfield_modified.npy"), modified_hf)
         np.save(str(agent_dir / "heightfield_final.npy"), agent_hf)

@@ -816,12 +816,13 @@ def preprocess_for_terrace(
     target_resolution: int = 256,
 ) -> np.ndarray:
     """
-    Lightweight preprocessing for terrace mode:
+    Coherence-aware preprocessing for terrace mode:
       1. Normalize to [0, 1].
       2. Downsample to target_resolution (INTER_AREA).
-      3. Mild high-frequency pruning (sigma = 0.5 * tool_radius_px).
-      4. Morphological opening to suppress narrow recesses narrower than
-         tool_diameter_mm (grey morphology).
+      3. Compute local gradient coherence (structure tensor anisotropy).
+      4. Adaptive smoothing: preserve directional structures (coherence > 0.5),
+         filter noise elsewhere (coherence < 0.3).
+      5. Selective morphological opening: only on non-directional regions.
 
     No slope optimisation, no terracing, no riser blurring.
     Quantisation is performed inside heightfield_to_terrace_mesh().
@@ -836,8 +837,42 @@ def preprocess_for_terrace(
     tool_radius_mm = tool_diameter_mm / 2.0
     tool_radius_px = tool_radius_mm / px_size
 
-    hf = prune_high_frequency_content(hf, tool_radius_mm, px_size)
-    hf = suppress_narrow_recesses(hf, tool_radius_px)
+    # --- Compute local coherence via structure tensor ---
+    gy, gx = np.gradient(hf)
+    sigma_int = max(target_resolution // 16, 4)
+    J00 = gaussian_filter(gx * gx, sigma_int)
+    J01 = gaussian_filter(gx * gy, sigma_int)
+    J11 = gaussian_filter(gy * gy, sigma_int)
+    tr = J00 + J11
+    det = J00 * J11 - J01 * J01
+    disc = np.sqrt(np.maximum(tr ** 2 - 4 * det, 0))
+    l1 = (tr + disc) / 2
+    l2 = (tr - disc) / 2
+    coherence = ((l1 - l2) / (l1 + l2 + 1e-8)).astype(np.float32)
+
+    # --- Adaptive Gaussian smoothing ---
+    # High coherence (>0.5): minimal smoothing to preserve directional structures
+    # Low coherence (<0.3): full smoothing to filter noise
+    original_sigma = max(tool_radius_mm * 0.5 / px_size, 0.5)
+    preserve_sigma = 0.5
+
+    hf_smooth_preserve = gaussian_filter(hf, sigma=preserve_sigma)
+    hf_smooth_full = gaussian_filter(hf, sigma=original_sigma)
+
+    # Blend: coherence 0..0.3 -> full smoothing, 0.5..1 -> preserve smoothing
+    blend = np.clip((coherence - 0.3) / 0.2, 0.0, 1.0)
+    hf = hf_smooth_preserve * blend + hf_smooth_full * (1.0 - blend)
+    hf = np.clip(hf, 0.0, 1.0).astype(np.float32)
+
+    # --- Selective morphological opening ---
+    # Only suppress narrow recesses in non-directional (low coherence) regions
+    low_coherence_mask = (coherence < 0.3).astype(np.float32)
+    # Smooth the mask boundary
+    low_coherence_mask = gaussian_filter(low_coherence_mask, sigma=2.0)
+    low_coherence_mask = np.clip(low_coherence_mask, 0.0, 1.0)
+
+    hf_opened = suppress_narrow_recesses(hf, tool_radius_px)
+    hf = hf * (1.0 - low_coherence_mask) + hf_opened * low_coherence_mask
 
     return np.clip(hf, 0.0, 1.0).astype(np.float32)
 

@@ -233,6 +233,36 @@ TOOL_SCHEMAS = [
     },
     # ── Region-Aware Directional Tools ─────────────────────────────────────
     {
+        "name": "image_guided_ridge_restore",
+        "description": "Restore ridge structures from original image where heightmap is too flat. "
+                       "Use when analysis shows low height_std — the diffusion model often loses "
+                       "fine ridge/valley detail that the original image carries.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "raw_blend_strength": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 0.8,
+                    "description": "How much image structure to blend in [0, 0.8]. Higher = more restoration.",
+                },
+                "ridge_threshold": {
+                    "type": "number",
+                    "minimum": 0.005,
+                    "maximum": 0.1,
+                    "description": "Local std below which to restore ridges. Lower = more selective.",
+                },
+                "smooth_boundary_px": {
+                    "type": "number",
+                    "minimum": 1.0,
+                    "maximum": 32.0,
+                    "description": "Feathering width at blend boundaries in pixels.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "directional_step_convert",
         "description": "Convert parallel-stripe regions (Type B) into directional stepped ridges. "
                        "Quantizes by coordinate perpendicular to grain direction instead of by height. "
@@ -426,6 +456,23 @@ def execute_tool(
         return result, f"Applied freq_band_boost({tool_input})", False
 
     # ── Region-Aware Directional Tools ─────────────────────────────────────
+    elif tool_name == "image_guided_ridge_restore":
+        image_gray = stored_masks.get("_image_gray") if stored_masks else None
+        if image_gray is None:
+            return current_hf, "ERROR: image_guided_ridge_restore requires image_gray data (not available in this context)", False
+        result = htk.image_guided_ridge_restore(
+            current_hf,
+            image_gray,
+            raw_blend_strength=float(tool_input.get("raw_blend_strength", 0.5)),
+            ridge_threshold=float(tool_input.get("ridge_threshold", 0.02)),
+            smooth_boundary_px=float(tool_input.get("smooth_boundary_px", 8.0)),
+        )
+        return result, (
+            f"Applied image_guided_ridge_restore("
+            f"strength={tool_input.get('raw_blend_strength', 0.5):.2f}, "
+            f"threshold={tool_input.get('ridge_threshold', 0.02):.4f})"
+        ), False
+
     elif tool_name == "directional_step_convert":
         use_mask = tool_input.get("use_region_mask", True)
         region_mask = None

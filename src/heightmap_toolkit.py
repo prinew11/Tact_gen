@@ -815,3 +815,63 @@ def directional_step_convert(
             result = hf * (1.0 - mask) + result * mask
 
     return np.clip(result, 0.0, 1.0).astype(np.float32)
+
+
+# ── Category 9: Image-Guided Restoration ──────────────────────────────────
+
+def image_guided_ridge_restore(
+    hf: np.ndarray,
+    image_gray: np.ndarray,
+    raw_blend_strength: float = 0.5,
+    ridge_threshold: float = 0.02,
+    smooth_boundary_px: float = 8.0,
+) -> np.ndarray:
+    """Restore ridge structures from original image where heightmap is too flat.
+
+    The diffusion model often produces near-flat regions that lose the fine
+    ridge/valley structure present in the original image. This function
+    identifies flat regions (low local std) and blends in the original
+    image structure to restore lost detail.
+
+    Args:
+        hf: Input heightfield float32 [0,1].
+        image_gray: Original image grayscale float32 [0,1], same shape as hf.
+        raw_blend_strength: Maximum blend factor for image structure [0, 0.8].
+        ridge_threshold: Local std below which to restore ridges.
+        smooth_boundary_px: Feathering width at blend boundaries.
+
+    Returns:
+        Modified heightfield, float32 [0,1].
+    """
+    hf = _validate(hf)
+    image_gray = np.asarray(image_gray, dtype=np.float32)
+    if image_gray.shape != hf.shape:
+        raise ValueError(f"Shape mismatch: hf={hf.shape} vs image_gray={image_gray.shape}")
+    image_gray = np.clip(image_gray, 0.0, 1.0)
+
+    raw_blend_strength = np.clip(raw_blend_strength, 0.0, 0.8)
+    ridge_threshold = max(ridge_threshold, 0.001)
+
+    # Compute local std using box filter (efficient approximation)
+    win_size = max(int(hf.shape[0] // 32), 8)
+    if win_size % 2 == 0:
+        win_size += 1
+
+    import cv2
+    hf_sq = hf * hf
+    local_mean = cv2.blur(hf, (win_size, win_size))
+    local_mean_sq = cv2.blur(hf_sq, (win_size, win_size))
+    local_var = local_mean_sq - local_mean * local_mean
+    local_std = np.sqrt(np.maximum(local_var, 0.0)).astype(np.float32)
+
+    # Blend factor: stronger where local_std is lower (flatter regions)
+    blend_factor = raw_blend_strength * np.clip(1.0 - local_std / ridge_threshold, 0.0, 1.0)
+
+    # Smooth the blend boundary
+    if smooth_boundary_px > 0:
+        blend_factor = gaussian_filter(blend_factor, sigma=smooth_boundary_px / 3.0)
+        blend_factor = np.clip(blend_factor, 0.0, raw_blend_strength)
+
+    # Blend image structure into heightmap
+    result = hf * (1.0 - blend_factor) + image_gray * blend_factor
+    return np.clip(result, 0.0, 1.0).astype(np.float32)

@@ -45,6 +45,8 @@ class HeightmapAnalysis:
     histogram_bimodality: float
     valley_fraction: float
     ridge_fraction: float
+    valley_std: float = 0.0
+    ridge_std: float = 0.0
     # Region classification (Type A = contour, Type B = directional stripe)
     region_b_fraction: float = 0.0       # fraction of area classified as Type B
     region_b_angle_deg: float = 0.0      # dominant grain angle in Type B regions
@@ -121,6 +123,11 @@ def analyze_heightmap(hf: np.ndarray) -> HeightmapAnalysis:
 
     valley_fraction = float((flat < np.percentile(flat, 25)).mean())
     ridge_fraction = float((flat > np.percentile(flat, 75)).mean())
+
+    valley_mask_2d = hf < np.percentile(flat, 25)
+    ridge_mask_2d = hf > np.percentile(flat, 75)
+    valley_std = float(hf[valley_mask_2d].std()) if valley_mask_2d.any() else 0.0
+    ridge_std = float(hf[ridge_mask_2d].std()) if ridge_mask_2d.any() else 0.0
 
     # ── Region classification: Type A (contour) vs Type B (directional stripe) ──
     # Type B = highly anisotropic structure tensor (λ2/λ1 ≈ 0)
@@ -208,6 +215,8 @@ def analyze_heightmap(hf: np.ndarray) -> HeightmapAnalysis:
         histogram_bimodality=histogram_bimodality,
         valley_fraction=valley_fraction,
         ridge_fraction=ridge_fraction,
+        valley_std=valley_std,
+        ridge_std=ridge_std,
         region_b_fraction=region_b_fraction,
         region_b_angle_deg=region_b_angle_deg,
         region_b_mask=region_b_mask,
@@ -242,7 +251,8 @@ def analysis_to_text(report: HeightmapAnalysis) -> str:
 - Frequency bands: low={report.low_freq_energy:.0%}, mid={report.mid_freq_energy:.0%}, high={report.high_freq_energy:.0%}
 - Dominant wavelength: {report.dominant_wavelength_px:.1f}px
 - Histogram: skewness={report.histogram_skewness:.2f}, bimodality={report.histogram_bimodality:.2f}
-- Valley/ridge fraction: valley={report.valley_fraction:.0%}, ridge={report.ridge_fraction:.0%}{region_text}"""
+- Valley/ridge fraction: valley={report.valley_fraction:.0%}, ridge={report.ridge_fraction:.0%}
+- Region std: valley={report.valley_std:.4f}, ridge={report.ridge_std:.4f}{region_text}"""
 
 
 def compare_analyses(before: HeightmapAnalysis, after: HeightmapAnalysis) -> str:
