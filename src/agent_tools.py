@@ -231,6 +231,37 @@ TOOL_SCHEMAS = [
             "required": [],
         },
     },
+    # ── Region-Aware Directional Tools ─────────────────────────────────────
+    {
+        "name": "directional_step_convert",
+        "description": "Convert parallel-stripe regions (Type B) into directional stepped ridges. "
+                       "Quantizes by coordinate perpendicular to grain direction instead of by height. "
+                       "Creates stepped ridges parallel to grain for CNC machining along grain direction. "
+                       "Only apply to Type B regions detected in analysis.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "angle_deg": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 180.0,
+                    "description": "Grain/ridge direction in degrees. Use region_b_angle_deg from analysis.",
+                },
+                "n_steps": {
+                    "type": "integer",
+                    "minimum": 4,
+                    "maximum": 12,
+                    "description": "Number of discrete step levels across grain direction.",
+                },
+                "use_region_mask": {
+                    "type": "boolean",
+                    "description": "If true, automatically use the Type B region mask from analysis. "
+                                   "If false, apply to entire heightfield.",
+                },
+            },
+            "required": ["angle_deg"],
+        },
+    },
     # ── Meta Tools ──────────────────────────────────────────────────────────
     {
         "name": "evaluate_result",
@@ -394,6 +425,24 @@ def execute_tool(
         result = htk.freq_band_boost(current_hf, **tool_input)
         return result, f"Applied freq_band_boost({tool_input})", False
 
+    # ── Region-Aware Directional Tools ─────────────────────────────────────
+    elif tool_name == "directional_step_convert":
+        use_mask = tool_input.get("use_region_mask", True)
+        region_mask = None
+        if use_mask and analysis_before is not None:
+            region_mask = getattr(analysis_before, "region_b_mask", None)
+        result = htk.directional_step_convert(
+            current_hf,
+            angle_deg=float(tool_input.get("angle_deg", 0.0)),
+            n_steps=int(tool_input.get("n_steps", 8)),
+            mask=region_mask,
+        )
+        return result, (
+            f"Applied directional_step_convert(angle={tool_input.get('angle_deg', 0.0):.1f}deg, "
+            f"n_steps={tool_input.get('n_steps', 8)}, "
+            f"mask={'region_b' if region_mask is not None else 'none'})"
+        ), False
+
     # ── Meta Tools ──────────────────────────────────────────────────────────
     elif tool_name == "evaluate_result":
         after = analyze_heightmap(current_hf)
@@ -488,6 +537,7 @@ def extract_plan_parameters(
         "texture_amount": 0.0,
         "smoothing_sigma": 0.0,
         "target_regions": "global",
+        "directional_step": None,  # {"angle_deg": ..., "n_steps": ..., "use_region_mask": ...}
         "notes": [],
     }
 
@@ -533,5 +583,16 @@ def extract_plan_parameters(
 
         elif name == "generate_mask":
             plan["notes"].append(f"mask generated: shape={inp.get('shape', 'unknown')}")
+
+        elif name == "directional_step_convert":
+            plan["directional_step"] = {
+                "angle_deg": float(inp.get("angle_deg", 0.0)),
+                "n_steps": int(inp.get("n_steps", 8)),
+                "use_region_mask": inp.get("use_region_mask", True),
+            }
+            plan["notes"].append(
+                f"directional_step_convert: angle={inp.get('angle_deg', 0.0):.1f}deg, "
+                f"n_steps={inp.get('n_steps', 8)}"
+            )
 
     return plan

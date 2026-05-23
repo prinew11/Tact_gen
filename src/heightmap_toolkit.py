@@ -709,3 +709,109 @@ def freq_band_boost(
     scale = 1.0 + (gain - 1.0) * band_mask
     result = np.real(np.fft.ifft2(np.fft.ifftshift(fft_shift * scale)))
     return np.clip(result, 0.0, 1.0).astype(np.float32)
+
+
+# ── Category 8: Region-Aware Directional Operations ────────────────────────
+
+def directional_step_convert(
+    hf: np.ndarray,
+    angle_deg: float = 0.0,
+    n_steps: int = 8,
+    step_width_px: float = 16.0,
+    mask: np.ndarray | None = None,
+    feather_px: float = 12.0,
+) -> np.ndarray:
+    """Convert parallel-stripe regions into directional stepped ridges.
+
+    Instead of quantizing by height (which flattens low-gradient stripes),
+    quantizes by the coordinate PERPENDICULAR to the grain direction.
+    This creates stepped ridges that run parallel to the grain —
+    tool cuts along grain direction, steps are across it.
+
+    Args:
+        hf: Input heightfield float32 [0,1].
+        angle_deg: Grain/ridge direction in degrees (0=horizontal).
+        n_steps: Number of discrete step levels (4-12).
+        step_width_px: Minimum width per step in pixels.
+            Controls the spatial frequency of stepping.
+        mask: Optional float32 [0,1] mask. Only areas where mask > 0.5
+            are converted; other areas pass through unchanged.
+            If None, the entire heightfield is converted.
+        feather_px: Feathering width at mask boundaries.
+
+    Returns:
+        Modified heightfield, float32 [0,1].
+    """
+    hf = _validate(hf)
+    h, w = hf.shape
+    angle_rad = np.radians(angle_deg)
+
+    # Build coordinate grid
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    cx, cy = w / 2.0, h / 2.0
+
+    # Project each pixel onto the axis PERPENDICULAR to grain direction
+    # grain direction = angle_deg, so perpendicular = angle_deg + 90
+    perp_angle = angle_rad + np.pi / 2.0
+    perp_coord = (xx - cx) * np.cos(perp_angle) + (yy - cy) * np.sin(perp_angle)
+
+    # Quantize the perpendicular coordinate into n_steps levels
+    coord_min = float(perp_coord.min())
+    coord_max = float(perp_coord.max())
+    coord_range = coord_max - coord_min
+
+    if coord_range < 1e-6 or n_steps < 2:
+        return hf.copy()
+
+    # Normalize perpendicular coordinate to [0, 1]
+    perp_norm = (perp_coord - coord_min) / coord_range
+
+    # Quantize into n_steps levels
+    n_steps = max(int(n_steps), 2)
+    stepped = np.floor(perp_norm * n_steps) / max(n_steps - 1, 1)
+    stepped = np.clip(stepped, 0.0, 1.0).astype(np.float32)
+
+    # Blend original height with stepped version:
+    # Use the stepped coordinate as a modulator — it creates the
+    # "across-grain staircase" while preserving the original height
+    # variation within each step band.
+    # Strategy: remap original height through the step function
+    # so that within each step band, height variation is preserved
+    # but bands have distinct levels.
+    band_idx = np.floor(perp_norm * n_steps).astype(np.int32)
+    band_idx = np.clip(band_idx, 0, n_steps - 1)
+
+    # Normalize height within each band
+    result = hf.copy()
+    for i in range(n_steps):
+        mask_band = (band_idx == i)
+        if not mask_band.any():
+            continue
+        band_vals = hf[mask_band]
+        b_min, b_max = float(band_vals.min()), float(band_vals.max())
+        if b_max - b_min > 1e-8:
+            # Normalize within band to [0, 1]
+            band_norm = (band_vals - b_min) / (b_max - b_min)
+        else:
+            band_norm = np.zeros_like(band_vals)
+
+        # Map to stepped range: each band occupies 1/n_steps of the height range
+        step_low = i / max(n_steps - 1, 1)
+        step_high = (i + 1) / max(n_steps - 1, 1)
+        # Preserve within-band variation but scale to 60% of band height
+        # (40% gap between bands ensures visible steps)
+        band_height = step_high - step_low
+        result[mask_band] = step_low + band_norm * band_height * 0.6
+
+    result = np.clip(result, 0.0, 1.0).astype(np.float32)
+
+    # Apply mask if provided — blend with original at boundaries
+    if mask is not None:
+        mask = np.asarray(mask, dtype=np.float32)
+        if mask.shape == hf.shape:
+            if feather_px > 0:
+                mask = gaussian_filter(mask, sigma=feather_px / 3.0)
+                mask = np.clip(mask, 0.0, 1.0)
+            result = hf * (1.0 - mask) + result * mask
+
+    return np.clip(result, 0.0, 1.0).astype(np.float32)

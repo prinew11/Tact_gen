@@ -121,6 +121,27 @@ def apply_agent_plan(
         candidate = gaussian_filter(candidate, sigma=smoothing_sigma)
         candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
 
+    # 4b. Directional step conversion for Type B regions (if agent requested it)
+    if plan.directional_step_angle_deg is not None:
+        import heightmap_toolkit as htk
+        from heightmap_analyzer import analyze_heightmap as _analyze
+        # Re-analyze to get the region mask on the current candidate
+        cand_analysis = _analyze(candidate)
+        ds_mask = cand_analysis.region_b_mask if plan.directional_step_use_region_mask else None
+        candidate = htk.directional_step_convert(
+            candidate,
+            angle_deg=plan.directional_step_angle_deg,
+            n_steps=plan.directional_step_n_steps or 8,
+            mask=ds_mask,
+            feather_px=12.0,
+        )
+        logger.info(
+            "apply_agent_plan: directional_step_convert applied (angle=%.1f, n_steps=%s, mask=%s)",
+            plan.directional_step_angle_deg,
+            plan.directional_step_n_steps or 8,
+            "region_b" if ds_mask is not None else "none",
+        )
+
     # 5. Apply region mask: modifications only where mask is active
     if region_mask is not None:
         candidate = base_hf * (1.0 - region_mask) + candidate * region_mask

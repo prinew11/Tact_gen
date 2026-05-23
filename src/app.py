@@ -449,6 +449,10 @@ def run_agent_transform(
     model: str,
     max_iterations: int,
     diffusion_steps: int,
+    physical_size: float = 100.0,
+    max_height: float = 20.0,
+    tool_diameter: float = 6.0,
+    terrace_steps: int = 12,
 ):
     """Run the agent pipeline: image -> diffusion -> preprocess -> agent plan -> validate -> terrace STL."""
     if image is None:
@@ -477,10 +481,10 @@ def run_agent_transform(
 
         # Terrace config (shared between preprocess and mesh generation)
         tc = TerraceConfig(
-            physical_size_mm=100.0,
-            max_height_mm=20.0,
-            tool_diameter_mm=6.0,
-            terrace_steps=12,
+            physical_size_mm=float(physical_size),
+            max_height_mm=float(max_height),
+            tool_diameter_mm=float(tool_diameter),
+            terrace_steps=int(terrace_steps),
         )
 
         # Preprocess FIRST — produces stable base heightfield
@@ -562,8 +566,16 @@ def run_agent_transform(
             f"- texture_amount: {plan.texture_amount:.3f}\n"
             f"- smoothing_sigma: {plan.smoothing_sigma:.3f}\n"
             f"- target_regions: {plan.target_regions}\n"
-            f"- preserve_large_structures: {plan.preserve_large_structures}\n\n"
-            f"### Before Analysis\n{before_text}\n\n"
+            f"- preserve_large_structures: {plan.preserve_large_structures}\n"
+        )
+        if plan.directional_step_angle_deg is not None:
+            info += (
+                f"- **directional_step**: angle={plan.directional_step_angle_deg:.1f}deg, "
+                f"n_steps={plan.directional_step_n_steps or 8}, "
+                f"mask={'region_b' if plan.directional_step_use_region_mask else 'none'}\n"
+            )
+        info += (
+            f"\n### Before Analysis\n{before_text}\n\n"
             f"### Evaluation\n{result.evaluation_notes}"
         )
         if log_lines:
@@ -912,6 +924,14 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 inp_ag_iters = gr.Slider(1, 8, value=5, step=1, label="Max iterations")
                 inp_ag_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Diffusion steps")
+            with gr.Accordion("Terrace Config (optional)", open=False):
+                gr.Markdown("Override terrace geometry parameters. Defaults work for most cases.")
+                with gr.Row():
+                    inp_ag_phys_size = gr.Number(label="Physical size (mm)", value=100.0)
+                    inp_ag_max_h = gr.Number(label="Max height (mm)", value=20.0)
+                with gr.Row():
+                    inp_ag_tool_dia = gr.Number(label="Tool diameter (mm)", value=6.0)
+                    inp_ag_steps = gr.Slider(2, 24, value=12, step=1, label="Terrace steps")
             btn_ag = gr.Button("Run Agent Transform", variant="primary")
             with gr.Row():
                 out_ag_before = gr.Image(label="Before (raw)")
@@ -924,6 +944,8 @@ def build_app() -> gr.Blocks:
                     inp_ag_img, inp_ag_intent,
                     inp_ag_api_key, inp_ag_base_url,
                     inp_ag_model, inp_ag_iters, inp_ag_diff_steps,
+                    inp_ag_phys_size, inp_ag_max_h,
+                    inp_ag_tool_dia, inp_ag_steps,
                 ],
                 outputs=[out_ag_before, out_ag_after, out_ag_stl, out_ag_info],
             )

@@ -42,6 +42,10 @@ class AgentEditPlan:
     smoothing_sigma: float = 0.0   # [0, 1.5]
     target_regions: str = "global" # "global", "ridges", "valleys", "high", "low"
     preserve_large_structures: bool = True
+    # Directional step conversion for Type B regions
+    directional_step_angle_deg: float | None = None
+    directional_step_n_steps: int | None = None
+    directional_step_use_region_mask: bool = True
     notes: list[str] = field(default_factory=list)
 
 
@@ -69,7 +73,8 @@ CRITICAL RULES:
 4. The terrace mesh generator is the final authority on geometry.
 
 ALLOWED TOOLS (analysis and planning only):
-- analyze_heightmap: read current metrics
+- analyze_heightmap: read current metrics (includes region classification)
+- directional_step_convert: convert Type B stripe regions to stepped ridges
 - generate_mask: create spatial masks for regional control
 - mask_apply: preview mask effect (requires generate_mask first)
 - evaluate_result: check metrics against intent
@@ -78,11 +83,28 @@ ALLOWED TOOLS (analysis and planning only):
 You may NOT directly mutate the geometry with boost_contrast, enhance_ridges, etc.
 Those operations are applied later by deterministic code based on your plan.
 
+REGION-AWARE STRATEGY:
+The analysis includes region classification:
+- Type A (contour-terracing): regions with real height gradients (knots, curved contours).
+  Standard terrace quantization works well for these.
+- Type B (directional-stepping): regions with high gradient coherence but low gradient
+  magnitude — parallel stripes with almost no height difference. These need special handling.
+
+If Type B regions are detected AND their fraction > 0.1:
+  1. Call directional_step_convert with the detected angle (region_b_angle_deg from analysis)
+     and use_region_mask=true to apply ONLY to Type B regions.
+  2. This converts parallel flat stripes into stepped ridges parallel to grain.
+  3. The tool preserves height variation within each step band while creating
+     distinct step levels across the grain direction.
+For Type A regions: standard terrace approach applies.
+NEVER apply directional_step_convert to Type A (knot/contour) regions.
+
 STRATEGY:
-1. Call analyze_heightmap to understand the preprocessed surface.
-2. Optionally generate_mask for spatial targeting.
-3. Call evaluate_result with intent keywords.
-4. Call propose_edit_plan with explicit bounded parameters:
+1. Call analyze_heightmap to understand the preprocessed surface and region classification.
+2. If Type B fraction > 0.1, call directional_step_convert with detected angle.
+3. Optionally generate_mask for additional spatial targeting.
+4. Call evaluate_result with intent keywords.
+5. Call propose_edit_plan with explicit bounded parameters:
    - ridge_boost: 0.0-0.35 (enhance_ridges strength)
    - contrast_boost: 0.0-0.25 (boost_contrast amount)
    - texture_amount: 0.0-0.10 (texture overlay intensity)
@@ -153,12 +175,21 @@ def run_agent_pipeline(
     # Extract bounded parameters from the plan proposal or tool call history
     plan_params = extract_plan_parameters(all_tool_calls, stored_masks)
 
+    # Extract directional step parameters if the agent called directional_step_convert
+    ds = plan_params.get("directional_step")
+    ds_angle = ds["angle_deg"] if ds else None
+    ds_steps = ds["n_steps"] if ds else None
+    ds_mask = ds.get("use_region_mask", True) if ds else True
+
     plan = AgentEditPlan(
         ridge_boost=plan_params.get("ridge_boost", 0.0),
         contrast_boost=plan_params.get("contrast_boost", 0.0),
         texture_amount=plan_params.get("texture_amount", 0.0),
         smoothing_sigma=plan_params.get("smoothing_sigma", 0.0),
         target_regions=plan_params.get("target_regions", "global"),
+        directional_step_angle_deg=ds_angle,
+        directional_step_n_steps=ds_steps,
+        directional_step_use_region_mask=ds_mask,
         notes=plan_params.get("notes", []),
     )
 
@@ -173,11 +204,21 @@ def run_agent_pipeline(
 
 
 def _build_initial_message(user_intent: str, analysis: HeightmapAnalysis) -> str:
+    region_hint = ""
+    if analysis.region_b_fraction > 0.1:
+        region_hint = f"""
+
+IMPORTANT: Region classification detected {analysis.region_b_fraction*100:.0f}% Type B
+(directional stripe) regions with dominant angle {analysis.region_b_angle_deg:.0f}deg.
+You should call directional_step_convert with angle_deg={analysis.region_b_angle_deg:.1f}
+and use_region_mask=true to convert these flat stripe areas into stepped ridges."""
+
     return f"""## User Intent
 "{user_intent}"
 
 ## Preprocessed Heightmap Analysis (base surface)
 {analysis_to_text(analysis)}
+{region_hint}
 
 ## Task
 Analyze this preprocessed heightmap and propose bounded enhancement parameters.
@@ -185,7 +226,8 @@ This surface is already machinable. Your job is to suggest improvements
 within safe parameter ranges.
 
 Available tools:
-- analyze_heightmap: read current metrics
+- analyze_heightmap: read current metrics (includes region classification)
+- directional_step_convert: convert Type B stripe regions to stepped ridges
 - generate_mask: create spatial masks for regional control
 - evaluate_result: check metrics against intent keywords
 - propose_edit_plan: submit bounded enhancement parameters
