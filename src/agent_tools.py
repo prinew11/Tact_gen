@@ -31,7 +31,7 @@ TOOL_SCHEMAS = [
             "properties": {
                 "target_distribution": {
                     "type": "string",
-                    "enum": ["uniform", "gaussian", "bimodal"],
+                    "enum": ["uniform", "gaussian", "bimodal", "emphasize_ridges"],
                     "description": "Target height distribution shape.",
                 },
                 "center": {
@@ -133,13 +133,13 @@ TOOL_SCHEMAS = [
             "properties": {
                 "feature_type": {
                     "type": "string",
-                    "enum": ["valley", "ridge", "channel", "dome"],
+                    "enum": ["valley", "ridge", "channel", "high"],
                     "description": "Type of feature to carve.",
                 },
                 "depth": {
                     "type": "number",
                     "minimum": 0.0,
-                    "maximum": 0.5,
+                    "maximum": 0.15,
                     "description": "Depth/height of the feature (default 0.2).",
                 },
                 "center_x": {
@@ -268,12 +268,25 @@ def execute_tool(
 
     # ── Creative Transformation Tools ────────────────────────────────────────
     elif tool_name == "redistribute_topology":
-        result = htk.height_redistribute(
-            current_hf,
-            target_distribution=tool_input.get("target_distribution", "uniform"),
-            center=float(tool_input.get("center", 0.5)),
-            width=float(tool_input.get("width", 0.2)),
-        )
+        target_dist = tool_input.get("target_distribution", "uniform")
+        strength = float(tool_input.get("width", 0.2))
+
+        if target_dist == "emphasize_ridges":
+            # Raise ridges, lower valleys — amplify relief
+            result = htk.height_selective_transform(
+                current_hf,
+                ridge_boost=strength * 0.3,
+                valley_boost=-strength * 0.15,
+                high_threshold=0.6,
+                low_threshold=0.4,
+            )
+        else:
+            result = htk.height_redistribute(
+                current_hf,
+                target_distribution=target_dist,
+                center=float(tool_input.get("center", 0.5)),
+                width=strength,
+            )
         stored_masks["_operations_log"].append({
             "tool": "redistribute_topology",
             "params": tool_input,
@@ -307,6 +320,10 @@ def execute_tool(
                 amplitude=amplitude, frequency=max(1.0, 512.0 / wavelength), angle_deg=angle,
             )
 
+        # Smooth texture edges: turn vertical jumps into gentle slopes
+        step_smooth = max(wavelength * 0.25, 2.0)
+        result = gaussian_filter(result, sigma=step_smooth).astype(np.float32)
+
         stored_masks["_operations_log"].append({
             "tool": "generate_directional_texture",
             "params": tool_input,
@@ -318,17 +335,23 @@ def execute_tool(
 
     elif tool_name == "blend_procedural_base":
         pattern_type = tool_input.get("pattern_type", "perlin")
-        result = htk.procedural_generate(
+        proc = htk.procedural_generate(
             pattern_type=pattern_type,
             size=current_hf.shape[0],
             frequency=float(tool_input.get("frequency", 4.0)),
             amplitude=1.0,
             seed=int(tool_input.get("seed", 42)),
         )
+        # Low-pass filter: keep only large-scale structure, no fine grain noise
+        H = current_hf.shape[0]
+        proc_smooth_sigma = max(H / 16.0, 4.0)
+        proc = gaussian_filter(proc, sigma=proc_smooth_sigma)
+        proc = np.clip(proc, 0, 1).astype(np.float32)
+
         # Blend generated pattern into current heightmap
         amplitude = float(tool_input.get("amplitude", 0.15))
         blend_mode = tool_input.get("blend_mode", "add")
-        result = htk.blend_two(current_hf, result, alpha=amplitude, blend_mode=blend_mode if blend_mode in ("linear", "multiply", "screen") else "linear")
+        result = htk.blend_two(current_hf, proc, alpha=amplitude, blend_mode=blend_mode if blend_mode in ("linear", "multiply", "screen") else "linear")
 
         stored_masks["_operations_log"].append({
             "tool": "blend_procedural_base",
@@ -364,8 +387,13 @@ def execute_tool(
                 resolution=current_hf.shape[0],
             )
             carved = current_hf - depth * mask
-        elif feature_type == "dome":
-            carved = current_hf + depth * mask * 0.5
+        elif feature_type == "high":
+            # Bidirectional stretch: raise highs, lower lows, preserve mean
+            p75 = float(np.percentile(current_hf, 75))
+            p25 = float(np.percentile(current_hf, 25))
+            high_mask = np.clip((current_hf - p75) / (1.0 - p75 + 1e-8), 0, 1)
+            low_mask = np.clip((p25 - current_hf) / (p25 + 1e-8), 0, 1)
+            carved = current_hf + depth * high_mask * mask - depth * 0.5 * low_mask * mask
         else:
             carved = current_hf
 

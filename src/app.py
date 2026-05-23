@@ -529,8 +529,21 @@ def run_agent_transform(
         accepted, reason = validate_agent_modified_heightfield(base_hf, modified_hf)
         agent_hf = modified_hf if accepted else base_hf
 
+        # Quantization pre-equalization: prevent agent operations from piling heights at one end
+        import cv2 as _cv2
+        agent_hf_u8 = (np.clip(agent_hf, 0, 1) * 255).astype(np.uint8)
+        clahe = _cv2.createCLAHE(clipLimit=1.5, tileGridSize=(2, 2))
+        agent_hf = clahe.apply(agent_hf_u8).astype(np.float32) / 255.0
+
         # Normalize for terrace quantization (expands range for more visible levels)
         terrace_hf = normalize_for_terrace_quantize(agent_hf, p_low=1.0, p_high=99.0, preserve_margin=0.02)
+
+        # Pre-smoothing before terrace mesh: sigma scales inversely with n_steps
+        # More steps → narrower per-step width → needs finer smoothing for continuity
+        from scipy.ndimage import gaussian_filter as _gf
+        pre_smooth_sigma = max((256 / tc.terrace_steps) * 0.3, 1.0)
+        terrace_hf = _gf(terrace_hf, sigma=pre_smooth_sigma).astype(np.float32)
+        terrace_hf = np.clip(terrace_hf, 0.02, 0.98)
 
         # Generate terrace mesh
         mesh, _report = heightfield_to_terrace_mesh(terrace_hf, tc)
