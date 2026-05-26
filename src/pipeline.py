@@ -85,7 +85,7 @@ class PipelineConfig:
     output_dir: str = "outputs/agent_run"
     diffusion_steps: int = 50
     diffusion_seed: int = 20
-    agent_model: str = "claude-sonnet-4-20250514"
+    agent_model: str = "claude-sonnet-4-6"
     agent_max_iterations: int = 3
     physical_size_mm: float = 50.0
     max_height_mm: float = 5.0

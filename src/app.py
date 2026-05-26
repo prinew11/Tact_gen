@@ -933,7 +933,7 @@ def build_app() -> gr.Blocks:
                 )
                 inp_ag_model = gr.Dropdown(
                     choices=[
-                        "claude-sonnet-4-20250514",
+                        "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
                         "mimo-v2.5-pro",
                         "mimo-v2.5",
@@ -941,7 +941,7 @@ def build_app() -> gr.Blocks:
                         "mimo-v2-omni",
                         "mimo-v2-flash",
                     ],
-                    value="claude-sonnet-4-20250514",
+                    value="claude-sonnet-4-6",
                     label="LLM Model",
                     allow_custom_value=True,
                 )
