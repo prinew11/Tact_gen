@@ -365,6 +365,7 @@ def run_saliency_geometry(
                 stripe_boost_strength=float(stripe_boost_strength),
             ),
             save_saliency_map=str(OUT / "weight_map.png"),
+            save_debug_dir=str(OUT / "saliency_debug"),
         )
         elapsed = time.time() - t0
 
@@ -517,7 +518,7 @@ def run_agent_transform(
         )
 
         # Preprocess FIRST — produces stable base heightfield
-        base_hf = preprocess_for_terrace(
+        base_hf, _ = preprocess_for_terrace(
             blended_hf,
             tool_diameter_mm=tc.tool_diameter_mm,
             physical_size_mm=tc.physical_size_mm,

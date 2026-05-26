@@ -2582,6 +2582,7 @@ def run_saliency_pipeline(
     terrace_config:     TerraceConfig  | None = None,
     saliency_config:    SaliencyConfig | None = None,
     save_saliency_map:  str | None = None,
+    save_debug_dir:     str | None = None,
 ) -> tuple[trimesh.Trimesh, np.ndarray, MachiningFilterReport, TerraceReport, SaliencyReport]:
     """
     Complete Tactile Saliency Guidance pipeline (FFT-based).
@@ -2603,6 +2604,10 @@ def run_saliency_pipeline(
     if saliency_config is None:
         saliency_config = SaliencyConfig()
 
+    _debug_dir: Path | None = Path(save_debug_dir) if save_debug_dir else None
+    if _debug_dir is not None:
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+
     # Step 0: Load heightfield
     hf = (np.load(raw_heightmap_path)
           if raw_heightmap_path.endswith(".npy")
@@ -2614,6 +2619,7 @@ def run_saliency_pipeline(
     # Step 0a: Percentile normalization (p2/p98)
     p2, p98 = np.percentile(hf, 2), np.percentile(hf, 98)
     hf = np.clip((hf - p2) / (p98 - p2 + 1e-8), 0, 1).astype(np.float32)
+    hf_raw = hf.copy()
 
     # Step 0b: Detrend — subtract global background surface (sigma=150px)
     print("Removing global trend (sigma=150px)...")
@@ -2623,6 +2629,23 @@ def run_saliency_pipeline(
     hf = hf / (hf.max() + 1e-8)
     hf = hf.astype(np.float32)
     print(f"  After detrend: std={hf.std():.4f} (should be > 0.14)")
+
+    # ① Save raw vs detrended comparison
+    if _debug_dir is not None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+        fig, axes = _plt.subplots(1, 2, figsize=(10, 5))
+        axes[0].imshow(hf_raw, cmap="gray", vmin=0, vmax=1)
+        axes[0].set_title("Raw (normalized)")
+        axes[0].axis("off")
+        axes[1].imshow(hf, cmap="gray", vmin=0, vmax=1)
+        axes[1].set_title("Detrended (σ=150px)")
+        axes[1].axis("off")
+        fig.tight_layout()
+        fig.savefig(str(_debug_dir / "01_raw_vs_detrended.png"), dpi=150)
+        _plt.close(fig)
+        print(f"  [debug] Saved: {_debug_dir / '01_raw_vs_detrended.png'}")
 
     # Step 0c: CLAHE — boost local contrast for both weight computation and geometry.
     # Low-contrast regions (e.g. uniform bright wood grain) produce w_height_range ≈ 0
@@ -2640,6 +2663,12 @@ def run_saliency_pipeline(
     hf_for_weight = _remove_heightmap_bias(hf, clip_limit=2.0, tile_grid_size=8)
     print(f"  Geometry std={hf.std():.4f}  Weight std={hf_for_weight.std():.4f}")
 
+    # ② Save CLAHE enhanced texture (hf_for_weight used for weight computation)
+    if _debug_dir is not None:
+        cv2.imwrite(str(_debug_dir / "02_clahe_enhanced.png"),
+                    (np.clip(hf_for_weight, 0, 1) * 255).astype(np.uint8))
+        print(f"  [debug] Saved: {_debug_dir / '02_clahe_enhanced.png'}")
+
     # Step 1: Multi-scale FFT + structure tensor + height range → weight map
     print("Computing machinability weight map...")
     tool_diameter_mm = config.tool_radius_mm * 2.0
@@ -2647,6 +2676,34 @@ def run_saliency_pipeline(
         hf_for_weight, hf_for_weight, config.physical_size_mm, tool_diameter_mm,
         config.max_height_mm, saliency_config
     )
+
+    # ③ Save FFT frequency spectrum (from center patch at largest scale)
+    if _debug_dir is not None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+        fft_scale = saliency_config.fft_scales[-1] if saliency_config.fft_scales else 128
+        cy, cx = hf_for_weight.shape[0] // 2, hf_for_weight.shape[1] // 2
+        half = fft_scale // 2
+        patch = hf_for_weight[cy - half:cy + half, cx - half:cx + half].astype(np.float64)
+        if patch.shape[0] == fft_scale and patch.shape[1] == fft_scale:
+            hann = np.hanning(fft_scale)[:, None] * np.hanning(fft_scale)[None, :]
+            windowed = patch * hann
+            spectrum = np.fft.fftshift(np.fft.fft2(windowed))
+            power = np.abs(spectrum) ** 2
+            power[fft_scale // 2, fft_scale // 2] = 0  # suppress DC
+            power_log = np.log1p(power)
+            fig, axes = _plt.subplots(1, 2, figsize=(10, 5))
+            axes[0].imshow(patch, cmap="gray")
+            axes[0].set_title(f"Center patch ({fft_scale}×{fft_scale})")
+            axes[0].axis("off")
+            axes[1].imshow(power_log, cmap="inferno")
+            axes[1].set_title("FFT power spectrum (log)")
+            axes[1].axis("off")
+            fig.tight_layout()
+            fig.savefig(str(_debug_dir / "03_fft_spectrum.png"), dpi=150)
+            _plt.close(fig)
+            print(f"  [debug] Saved: {_debug_dir / '03_fft_spectrum.png'}")
     print(f"  Weight: mean={sal_report.weight_mean:.3f}, "
           f"high={sal_report.high_weight_fraction:.1%}, "
           f"low={sal_report.low_weight_fraction:.1%}, "
@@ -2666,6 +2723,21 @@ def run_saliency_pipeline(
         w_vis = (weight_map * 255).astype(np.uint8)
         Image.fromarray(w_vis).save(save_saliency_map)
         print(f"  Weight map saved: {save_saliency_map}")
+
+    # ④ Save final fused weight map to debug dir (colormap version for presentation)
+    if _debug_dir is not None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+        fig, ax = _plt.subplots(figsize=(6, 5))
+        im = ax.imshow(weight_map, cmap="viridis", vmin=0, vmax=1)
+        ax.set_title("Machinability weight map")
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.tight_layout()
+        fig.savefig(str(_debug_dir / "04_weight_map.png"), dpi=150)
+        _plt.close(fig)
+        print(f"  [debug] Saved: {_debug_dir / '04_weight_map.png'}")
 
     hf = normalize_heightfield(hf)
 

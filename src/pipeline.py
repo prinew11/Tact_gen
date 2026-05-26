@@ -281,7 +281,7 @@ def run_full_pipeline(config: PipelineConfig) -> PipelineResult:
     np.save(out_dir / "heightfield_blended.npy", blended_hf)
 
     # 2. Preprocess FIRST (produces stable base)
-    base_hf = preprocess_for_terrace(
+    base_hf, _ = preprocess_for_terrace(
         blended_hf,
         tool_diameter_mm=config.tool_diameter_mm,
         physical_size_mm=config.physical_size_mm,
@@ -376,7 +376,7 @@ def run_agent_only(
     raw_hf = np.load(heightmap_path).astype(np.float32)
 
     # Preprocess first
-    base_hf = preprocess_for_terrace(raw_hf)
+    base_hf, _ = preprocess_for_terrace(raw_hf)
     np.save(out_dir / "heightfield_base.npy", base_hf)
 
     # Agent planning (creative mode)
