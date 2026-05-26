@@ -297,7 +297,8 @@ def _load_best_heightfield(heightfield_file) -> tuple[np.ndarray, str]:
 # ===== 4. Saliency-Guided Geometry ==========================================
 
 def run_saliency_geometry(
-    heightfield_file,
+    input_file: str | None,
+    diffusion_steps: int,
     physical_size: float, max_height: float, tool_radius: float,
     steps_high: int, steps_low: int,
     thresh_high: float, thresh_low: float,
@@ -307,14 +308,28 @@ def run_saliency_geometry(
     stripe_expansion_factor: float = 0.0,
     stripe_boost_strength: float = 2.5,
 ):
-    """Multi-scale FFT + structure tensor + height range → machinability-weighted terrace."""
+    """Image → Diffusion → Multi-scale FFT + structure tensor → machinability-weighted terrace."""
     try:
+        import cv2
+        from PIL import Image as PILImage
+        from diffusion_pipeline import DiffusionConfig, generate_heightfield
         from terrace_geometry import (
             MachiningFilterConfig, TerraceConfig, SaliencyConfig,
             run_saliency_pipeline, save_stl as terrace_save_stl,
         )
 
-        hf, hf_source = _load_best_heightfield(heightfield_file)
+        # Auto-detect: .npy → load directly; image → run diffusion
+        if input_file is not None and input_file.endswith(".npy"):
+            hf = np.load(input_file)
+            hf_source = f"loaded from {Path(input_file).name}"
+        elif input_file is not None:
+            img = np.array(PILImage.open(input_file).convert("RGB"))
+            rgb = cv2.resize(img, (512, 512), interpolation=cv2.INTER_AREA)
+            diff_config = DiffusionConfig(num_inference_steps=int(diffusion_steps))
+            hf = generate_heightfield(rgb, diff_config)
+            hf_source = "diffusion from uploaded image"
+        else:
+            hf, hf_source = _load_best_heightfield(None)
         hf_raw_path = OUT / "heightfields" / "heightfield_raw.npy"
         hf_raw_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(hf_raw_path), hf)
@@ -699,117 +714,242 @@ def _make_test_heightfield(size: int = 512) -> np.ndarray:
 
 # ===== Build UI =============================================================
 
+CSS = """
+/* ── Web Font (Inter — closest free match to Proxima Nova) ── */
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;500;600;700&display=swap');
+
+/* ── Global ── */
+body, .gradio-container {
+    background: #FAF9F6 !important;
+    font-family: 'Inter', 'Proxima Nova', 'Avenir', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif !important;
+    color: #1a1a1a !important;
+}
+
+/* ── Header ── */
+#app-header {
+    text-align: center;
+    padding: 28px 0 8px 0;
+    border-bottom: 1px solid #e8e4de;
+    margin-bottom: 24px;
+}
+#app-header h1 {
+    font-family: 'DM Serif Display', 'Georgia', serif !important;
+    font-size: 2.4rem !important;
+    font-weight: 400 !important;
+    color: #1a1a1a !important;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px 0 !important;
+    line-height: 1.15;
+}
+#app-header p {
+    font-size: 0.88rem !important;
+    color: #6b6560 !important;
+    margin: 0 !important;
+}
+
+/* ── Main Tabs (Saliency / Agent) ── */
+.main-tabs > .tab-nav {
+    display: flex !important;
+    justify-content: center !important;
+    gap: 10px !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 0 24px 0 !important;
+}
+.main-tabs > .tab-nav > button {
+    font-size: 1.25rem !important;
+    font-weight: 600 !important;
+    padding: 16px 52px !important;
+    border-radius: 14px !important;
+    border: 2px solid #e0dbd3 !important;
+    background: #fff !important;
+    color: #4a4540 !important;
+    transition: all 0.2s ease !important;
+    letter-spacing: -0.01em;
+    min-width: 280px !important;
+}
+.main-tabs > .tab-nav > button:hover {
+    border-color: #c9a96e !important;
+    background: #fdf8f0 !important;
+    color: #1a1a1a !important;
+}
+.main-tabs > .tab-nav > button.selected,
+.main-tabs > .tab-nav > button[aria-selected="true"] {
+    background: linear-gradient(135deg, #D4A574 0%, #C9956A 100%) !important;
+    color: #fff !important;
+    border-color: #C9956A !important;
+    box-shadow: 0 4px 14px rgba(201, 149, 106, 0.3) !important;
+}
+
+/* ── Tab content sections ── */
+.tab-section-title {
+    font-family: 'DM Serif Display', 'Georgia', serif !important;
+    font-size: 1.35rem !important;
+    font-weight: 400 !important;
+    color: #1a1a1a !important;
+    margin: 0 0 4px 0 !important;
+    line-height: 1.3;
+}
+.tab-section-desc {
+    font-size: 0.88rem !important;
+    color: #6b6560 !important;
+    line-height: 1.55 !important;
+    margin: 0 0 18px 0 !important;
+}
+.tab-pipeline-badge {
+    display: inline-block;
+    background: #f0ece6;
+    color: #6b6560;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 6px;
+    letter-spacing: 0.03em;
+    margin-bottom: 12px;
+}
+
+/* ── Utility accordion (bottom) ── */
+.utility-accordion {
+    margin-top: 28px;
+    border-top: 1px solid #e8e4de;
+    padding-top: 16px;
+}
+.utility-accordion > .label-wrap {
+    cursor: pointer;
+    padding: 10px 16px !important;
+    border-radius: 10px !important;
+    background: #f5f2ed !important;
+    transition: background 0.15s;
+}
+.utility-accordion > .label-wrap:hover {
+    background: #ede9e2 !important;
+}
+.utility-accordion .title {
+    font-size: 0.9rem !important;
+    font-weight: 500 !important;
+    color: #6b6560 !important;
+}
+
+/* ── Cards / panels ── */
+.gradio-group, .gr-box, .panel {
+    border-radius: 12px !important;
+    border: 1px solid #e8e4de !important;
+    background: #fff !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04) !important;
+}
+
+/* ── Run Buttons ── */
+button.primary, button.variant-primary {
+    background: linear-gradient(135deg, #D4A574 0%, #C9956A 100%) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 0.95rem !important;
+    padding: 12px 36px !important;
+    box-shadow: 0 2px 8px rgba(201, 149, 106, 0.25) !important;
+    transition: all 0.2s ease !important;
+    letter-spacing: 0.01em;
+}
+button.primary:hover, button.variant-primary:hover {
+    box-shadow: 0 4px 14px rgba(201, 149, 106, 0.4) !important;
+    transform: translateY(-1px);
+}
+
+/* ── Sliders ── */
+input[type="range"] {
+    accent-color: #C9956A !important;
+}
+
+/* ── Labels ── */
+label, .label-wrap label {
+    font-weight: 500 !important;
+    color: #3a3530 !important;
+    font-size: 0.85rem !important;
+}
+label .label-text, .label-wrap .label-text {
+    font-weight: 600 !important;
+    color: #2a2520 !important;
+}
+
+/* ── Markdown content ── */
+.gradio-markdown h3, .gradio-markdown h4 {
+    color: #1a1a1a !important;
+    font-weight: 600 !important;
+}
+.gradio-markdown p {
+    color: #4a4540 !important;
+    line-height: 1.6 !important;
+}
+.gradio-markdown code {
+    background: #f0ece6 !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+    font-size: 0.85em !important;
+}
+
+/* ── Image upload area ── */
+.gr-image {
+    border-radius: 12px !important;
+    border: 2px dashed #d5d0c8 !important;
+    background: #fdfcfa !important;
+}
+.gr-image:hover {
+    border-color: #C9956A !important;
+}
+
+/* ── Accordion ── */
+.gradio-accordion {
+    border-radius: 12px !important;
+    border: 1px solid #e8e4de !important;
+}
+
+/* ── Footer ── */
+#app-footer {
+    text-align: center;
+    padding: 20px 0 12px 0;
+    color: #a09890 !important;
+    font-size: 0.78rem !important;
+    border-top: 1px solid #e8e4de;
+    margin-top: 32px;
+}
+"""
+
+
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Tactile Geometry — Module Test", theme=gr.themes.Soft()) as app:
-        gr.Markdown("# Tactile Geometry Generation — Module Test Panel")
-        gr.Markdown("Upload an image or load a .npy heightfield to test each pipeline module.")
+    with gr.Blocks(title="Tactile Geometry", css=CSS) as app:
+        gr.Markdown(
+            '<div id="app-header">'
+            '<h1>Tactile Geometry Generation</h1>'
+            '<p>Transform texture images into fabrication-ready stepped heightmaps</p>'
+            '</div>',
+        )
 
-        # ---- Tab 0: Environment Check ----
-        with gr.Tab("0. Environment Check"):
-            gr.Markdown("Click the button to check if all dependencies are installed.")
-            btn_env = gr.Button("Check Environment", variant="primary")
-            out_env = gr.Markdown()
-            btn_env.click(run_env_check, outputs=out_env)
-
-        # ---- Tab 1: Preprocessing ----
-        with gr.Tab("1. Preprocessing"):
-            gr.Markdown("Upload image -> Grayscale / Edge detection / High-frequency features")
-            with gr.Row():
-                inp_pre_img = gr.Image(label="Input Image", type="numpy")
-            btn_pre = gr.Button("Run Preprocessing", variant="primary")
-            with gr.Row():
-                out_pre_gray = gr.Image(label="Grayscale")
-                out_pre_edge = gr.Image(label="Edge Detection")
-                out_pre_freq = gr.Image(label="High Frequency")
-            out_pre_info = gr.Markdown()
-            btn_pre.click(
-                run_preprocessing, inputs=inp_pre_img,
-                outputs=[out_pre_gray, out_pre_edge, out_pre_freq, out_pre_info],
-            )
-
-        # ---- Tab 2: Tactile Mapping ----
-        with gr.Tab("2. Tactile Mapping"):
-            gr.Markdown("Upload image -> Compute tactile descriptors (roughness / directionality / frequency)")
-            inp_tac_img = gr.Image(label="Input Image", type="numpy")
-            btn_tac = gr.Button("Run Tactile Mapping", variant="primary")
-            out_tac = gr.Markdown()
-            btn_tac.click(run_tactile_mapping, inputs=inp_tac_img, outputs=out_tac)
-
-        # ---- Tab 2.5: Smart Crop ----
-        with gr.Tab("2.5 Smart Crop"):
+        # ===== Main Tab 1: Saliency-Guided Terrace ============================
+        with gr.Tabs(elem_classes="main-tabs") as main_tabs:
+          with gr.Tab("Saliency-Guided Terrace"):
             gr.Markdown(
-                "When texture details are too fine for the tool, auto or manual crop region selection.\n\n"
-                "**Auto**: argmax of weighted (roughness + directionality + frequency) heatmap.\n"
-                "**Manual**: use X/Y sliders to select position from heatmap."
-            )
-            inp_crop_img = gr.Image(label="Input Image", type="numpy")
-            inp_crop_frac = gr.Slider(
-                0.2, 1.0, value=0.5, step=0.05,
-                label="Crop side / shorter image side",
-            )
-            with gr.Row():
-                inp_crop_w_rough = gr.Slider(
-                    0.0, 2.0, value=1.0, step=0.1, label="Roughness weight",
-                )
-                inp_crop_w_dir = gr.Slider(
-                    0.0, 2.0, value=0.5, step=0.1, label="Directionality weight",
-                )
-                inp_crop_w_freq = gr.Slider(
-                    0.0, 2.0, value=1.0, step=0.1, label="Frequency weight",
-                )
-            inp_crop_mode = gr.Radio(
-                choices=["Auto", "Manual"], value="Auto", label="Crop positioning mode",
+                '<div class="tab-pipeline-badge">IMAGE → DIFFUSION → SALIENCY → STL</div>'
+                '<p class="tab-section-title">Saliency-Guided Terrace</p>'
+                '<p class="tab-section-desc">'
+                'Upload a texture image, the diffusion model generates a heightfield, '
+                'then multi-scale FFT + structure tensor + height range analysis produces '
+                'a machinability-weighted terrace mesh ready for CNC fabrication.'
+                '</p>',
             )
             with gr.Row():
-                inp_crop_mx = gr.Slider(
-                    0.0, 1.0, value=0.5, step=0.01, label="Manual X center (normalized)",
+                inp_sal_input = gr.File(
+                    label="Input Image or .npy Heightfield",
+                    file_types=[".npy", ".png", ".jpg", ".jpeg", ".webp", ".bmp"],
+                    type="filepath",
                 )
-                inp_crop_my = gr.Slider(
-                    0.0, 1.0, value=0.5, step=0.01, label="Manual Y center (normalized)",
-                )
-            btn_crop = gr.Button("Run", variant="primary")
-            with gr.Row():
-                out_crop_overlay = gr.Image(label="Feature heatmap + crop box")
-                out_crop_image = gr.Image(label="Cropped result")
-            out_crop_info = gr.Markdown()
-            btn_crop.click(
-                run_smart_crop,
-                inputs=[inp_crop_img, inp_crop_frac,
-                        inp_crop_w_rough, inp_crop_w_dir, inp_crop_w_freq,
-                        inp_crop_mode, inp_crop_mx, inp_crop_my],
-                outputs=[out_crop_overlay, out_crop_image, out_crop_info],
-            )
-
-        # ---- Tab 3: Diffusion ----
-        with gr.Tab("3. Diffusion Pipeline"):
-            gr.Markdown("Upload image -> Local trained model -> Generate heightfield\n\n"
-                        "**Train model first**: `python src/training/train.py`")
-            inp_diff_img = gr.Image(label="Input Image", type="numpy")
-            inp_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Sampling steps")
-            btn_diff = gr.Button("Run Diffusion", variant="primary")
-            out_diff_img = gr.Image(label="Raw heightfield")
-            out_diff_info = gr.Markdown()
-            btn_diff.click(
-                run_diffusion,
-                inputs=[inp_diff_img, inp_diff_steps],
-                outputs=[out_diff_img, out_diff_info],
-            )
-
-        # ---- Tab 4: Saliency-Guided Geometry ----
-        with gr.Tab("4. Saliency-Guided Terrace"):
-            gr.Markdown(
-                "Multi-scale FFT + structure tensor + height range → machinability weight.\n\n"
-                "Weight = w_period x w_orientation x w_height_range. "
-                "All three conditions must be satisfied for full preservation.\n\n"
-                "- **Period**: multi-scale FFT (32/64/128px), energy-weighted average\n"
-                "- **Orientation**: structure tensor coherence x alignment with toolpath\n"
-                "- **Height range**: peak-valley difference; negligible features (< tolerance) are smoothed"
-            )
-            inp_sal_file = gr.File(label="Upload raw heightfield .npy", file_types=[".npy"])
-            with gr.Row():
-                inp_sal_size = gr.Number(label="Physical size (mm)", value=100.0)
-                inp_sal_h = gr.Number(label="Max height (mm)", value=5.0)
-                inp_sal_tr = gr.Number(label="Tool radius (mm)", value=3.0)
+                with gr.Column():
+                    inp_sal_diff_steps = gr.Slider(
+                        10, 100, value=50, step=1, label="Diffusion steps",
+                    )
+                    inp_sal_size = gr.Number(label="Physical size (mm)", value=100.0)
+                    inp_sal_h = gr.Number(label="Max height (mm)", value=5.0)
+                    inp_sal_tr = gr.Number(label="Tool radius (mm)", value=3.0)
             with gr.Row():
                 inp_sal_steps_hi = gr.Slider(
                     4, 24, value=12, step=1,
@@ -828,53 +968,51 @@ def build_app() -> gr.Blocks:
                     0.1, 0.6, value=0.30, step=0.05,
                     label="Weight threshold (low)",
                 )
-            gr.Markdown("**FFT analysis** (multi-scale: 32 / 64 / 128 px)")
             with gr.Row():
-                inp_sal_fft_stride = gr.Slider(
-                    4, 64, value=16, step=4,
-                    label="FFT stride (px)",
-                )
-                inp_sal_fft_thresh = gr.Slider(
-                    0.05, 0.5, value=0.20, step=0.05,
-                    label="Energy threshold (non-periodic detection)",
-                )
-            gr.Markdown("**Structure tensor & height range**")
-            with gr.Row():
-                inp_sal_struct_sigma = gr.Slider(
-                    4.0, 20.0, value=10.0, step=1.0,
-                    label="Structure tensor sigma (px)",
-                )
-                inp_sal_tool_angle = gr.Slider(
-                    0, 180, value=0, step=5,
-                    label="Toolpath angle (deg, 0=horizontal)",
-                )
-                inp_sal_tolerance = gr.Slider(
-                    0.01, 0.20, value=0.05, step=0.01,
-                    label="Tool tolerance (mm)",
-                )
-            with gr.Row():
-                inp_sal_blur = gr.Slider(
-                    1.0, 20.0, value=8.0, step=1.0,
-                    label="Weight blur sigma (px)",
-                )
                 inp_sal_mesh_res = gr.Slider(
                     64, 512, value=256, step=32,
                     label="Mesh resolution",
                 )
-            with gr.Row():
-                inp_sal_stripe = gr.Slider(
-                    0.0, 3.0, value=0.0, step=0.1,
-                    label="Stripe expansion (× tool diameter, 0 = off)",
-                    info="Expand dense parallel stripes to machinable spacing. "
-                         "1.5 = target spacing 1.5× tool diameter.",
-                )
-                inp_sal_boost = gr.Slider(
-                    1.0, 5.0, value=2.5, step=0.1,
-                    label="Stripe boost strength",
-                    info="Amplify stripe amplitude before terracing. "
-                         "Auto-on when stripes detected (coherence > 0.06). "
-                         "1.0 = off, 2.5 = default (2.5× stripe amplitude).",
-                )
+            with gr.Accordion("Advanced Parameters", open=False):
+                gr.Markdown("**FFT analysis** (multi-scale: 32 / 64 / 128 px)")
+                with gr.Row():
+                    inp_sal_fft_stride = gr.Slider(
+                        4, 64, value=16, step=4, label="FFT stride (px)",
+                    )
+                    inp_sal_fft_thresh = gr.Slider(
+                        0.05, 0.5, value=0.20, step=0.05,
+                        label="Energy threshold (non-periodic detection)",
+                    )
+                gr.Markdown("**Structure tensor & height range**")
+                with gr.Row():
+                    inp_sal_struct_sigma = gr.Slider(
+                        4.0, 20.0, value=10.0, step=1.0,
+                        label="Structure tensor sigma (px)",
+                    )
+                    inp_sal_tool_angle = gr.Slider(
+                        0, 180, value=0, step=5,
+                        label="Toolpath angle (deg, 0=horizontal)",
+                    )
+                    inp_sal_tolerance = gr.Slider(
+                        0.01, 0.20, value=0.05, step=0.01,
+                        label="Tool tolerance (mm)",
+                    )
+                with gr.Row():
+                    inp_sal_blur = gr.Slider(
+                        1.0, 20.0, value=8.0, step=1.0,
+                        label="Weight blur sigma (px)",
+                    )
+                with gr.Row():
+                    inp_sal_stripe = gr.Slider(
+                        0.0, 3.0, value=0.0, step=0.1,
+                        label="Stripe expansion (× tool diameter, 0 = off)",
+                        info="Expand dense parallel stripes to machinable spacing.",
+                    )
+                    inp_sal_boost = gr.Slider(
+                        1.0, 5.0, value=2.5, step=0.1,
+                        label="Stripe boost strength",
+                        info="Amplify stripe amplitude before terracing. 1.0 = off.",
+                    )
             btn_sal = gr.Button("Run Saliency Pipeline", variant="primary")
             with gr.Row():
                 out_sal_hf = gr.Image(label="Machinable heightmap (2D)")
@@ -883,7 +1021,7 @@ def build_app() -> gr.Blocks:
             out_sal_info = gr.Markdown()
             btn_sal.click(
                 run_saliency_geometry,
-                inputs=[inp_sal_file,
+                inputs=[inp_sal_input, inp_sal_diff_steps,
                         inp_sal_size, inp_sal_h, inp_sal_tr,
                         inp_sal_steps_hi, inp_sal_steps_lo,
                         inp_sal_thresh_hi, inp_sal_thresh_lo,
@@ -894,37 +1032,28 @@ def build_app() -> gr.Blocks:
                 outputs=[out_sal_hf, out_sal_stl, out_sal_saliency, out_sal_info],
             )
 
-        # ---- Tab 5: Mockup ----
-        with gr.Tab("5. Mockup (OBJ)"):
-            gr.Markdown("Load .npy heightfield -> 256x256 low-res OBJ preview")
-            inp_moc_file = gr.File(label="Upload .npy (optional)", file_types=[".npy"])
-            with gr.Row():
-                inp_moc_size = gr.Number(label="Physical size (mm)", value=100.0)
-                inp_moc_h = gr.Number(label="Max height (mm)", value=10.0)
-            btn_moc = gr.Button("Run Mockup", variant="primary")
-            out_moc_img = gr.Image(label="Mockup Render")
-            out_moc_info = gr.Markdown()
-            btn_moc.click(
-                run_mockup,
-                inputs=[inp_moc_file, inp_moc_size, inp_moc_h],
-                outputs=[out_moc_img, out_moc_info],
-            )
-
-        # ---- Tab 6: Agent Transform ----
-        with gr.Tab("6. Agent Transform"):
+          # ===== Main Tab 2: Agent Transform ====================================
+          with gr.Tab("Agent Transform"):
             gr.Markdown(
-                "LLM agent creatively transforms a heightmap based on your tactile intent.\n\n"
-                "Pipeline: Image → Diffusion → Agent Transform → Terrace STL\n\n"
-                "The agent uses 23 toolkit operations (frequency-aware, creative, patterns, ...) "
-                "and iterates up to N times to match your description.\n\n"
-                "**Requires**: API key for Anthropic or MiMo."
+                '<div class="tab-pipeline-badge">IMAGE → DIFFUSION → AGENT → STL</div>'
+                '<p class="tab-section-title">Agent Transform</p>'
+                '<p class="tab-section-desc">'
+                'LLM agent creatively transforms a heightmap based on your tactile intent. '
+                'Uses 23 toolkit operations (frequency-aware, creative, patterns) '
+                'and iterates to match your description.'
+                '</p>',
             )
-            inp_ag_img = gr.Image(label="Input Image", type="numpy")
-            inp_ag_intent = gr.Textbox(
-                label="Tactile intent",
-                value="rough organic surface with flowing ridges, preserve large-scale contours, convert fine texture to stepped stripes",
-                lines=2,
-            )
+            with gr.Row():
+                inp_ag_img = gr.Image(label="Input Image", type="numpy")
+                with gr.Column():
+                    inp_ag_intent = gr.Textbox(
+                        label="Tactile intent",
+                        value="rough organic surface with flowing ridges, preserve large-scale contours, convert fine texture to stepped stripes",
+                        lines=3,
+                    )
+                    inp_ag_diff_steps = gr.Slider(
+                        10, 100, value=50, step=1, label="Diffusion steps",
+                    )
             with gr.Row():
                 inp_ag_api_key = gr.Textbox(
                     label="API Key",
@@ -945,13 +1074,12 @@ def build_app() -> gr.Blocks:
                     label="LLM Model",
                     allow_custom_value=True,
                 )
-            inp_ag_base_url = gr.Textbox(
-                label="Base URL (leave empty for Anthropic, or set MiMo URL)",
-                placeholder="https://token-plan-cn.xiaomimimo.com/anthropic",
-            )
             with gr.Row():
+                inp_ag_base_url = gr.Textbox(
+                    label="Base URL (leave empty for Anthropic, or set MiMo URL)",
+                    placeholder="https://token-plan-cn.xiaomimimo.com/anthropic",
+                )
                 inp_ag_iters = gr.Slider(1, 8, value=5, step=1, label="Max iterations")
-                inp_ag_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Diffusion steps")
             with gr.Accordion("Terrace Config (optional)", open=False):
                 gr.Markdown("Override terrace geometry parameters. Defaults work for most cases.")
                 with gr.Row():
@@ -977,6 +1105,92 @@ def build_app() -> gr.Blocks:
                 ],
                 outputs=[out_ag_before, out_ag_after, out_ag_stl, out_ag_info],
             )
+
+        # ===== Tools & Utilities (collapsed accordion at the bottom) ==========
+        with gr.Accordion("Tools & Utilities", open=False, elem_classes="utility-accordion"):
+            with gr.Tabs():
+                with gr.Tab("Environment Check"):
+                    gr.Markdown("Click the button to check if all dependencies are installed.")
+                    btn_env = gr.Button("Check Environment", variant="primary")
+                    out_env = gr.Markdown()
+                    btn_env.click(run_env_check, outputs=out_env)
+
+                with gr.Tab("Preprocessing"):
+                    gr.Markdown("Upload image -> Grayscale / Edge detection / High-frequency features")
+                    inp_pre_img = gr.Image(label="Input Image", type="numpy")
+                    btn_pre = gr.Button("Run Preprocessing", variant="primary")
+                    with gr.Row():
+                        out_pre_gray = gr.Image(label="Grayscale")
+                        out_pre_edge = gr.Image(label="Edge Detection")
+                        out_pre_freq = gr.Image(label="High Frequency")
+                    out_pre_info = gr.Markdown()
+                    btn_pre.click(
+                        run_preprocessing, inputs=inp_pre_img,
+                        outputs=[out_pre_gray, out_pre_edge, out_pre_freq, out_pre_info],
+                    )
+
+                with gr.Tab("Tactile Mapping"):
+                    gr.Markdown("Upload image -> Compute tactile descriptors (roughness / directionality / frequency)")
+                    inp_tac_img = gr.Image(label="Input Image", type="numpy")
+                    btn_tac = gr.Button("Run Tactile Mapping", variant="primary")
+                    out_tac = gr.Markdown()
+                    btn_tac.click(run_tactile_mapping, inputs=inp_tac_img, outputs=out_tac)
+
+                with gr.Tab("Smart Crop"):
+                    gr.Markdown("Auto or manual crop region selection using weighted heatmap.")
+                    inp_crop_img = gr.Image(label="Input Image", type="numpy")
+                    inp_crop_frac = gr.Slider(0.2, 1.0, value=0.5, step=0.05, label="Crop side / shorter image side")
+                    with gr.Row():
+                        inp_crop_w_rough = gr.Slider(0.0, 2.0, value=1.0, step=0.1, label="Roughness weight")
+                        inp_crop_w_dir   = gr.Slider(0.0, 2.0, value=0.5, step=0.1, label="Directionality weight")
+                        inp_crop_w_freq  = gr.Slider(0.0, 2.0, value=1.0, step=0.1, label="Frequency weight")
+                    inp_crop_mode = gr.Radio(choices=["Auto", "Manual"], value="Auto", label="Crop positioning mode")
+                    with gr.Row():
+                        inp_crop_mx = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="Manual X center")
+                        inp_crop_my = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="Manual Y center")
+                    btn_crop = gr.Button("Run", variant="primary")
+                    with gr.Row():
+                        out_crop_overlay = gr.Image(label="Feature heatmap + crop box")
+                        out_crop_image   = gr.Image(label="Cropped result")
+                    out_crop_info = gr.Markdown()
+                    btn_crop.click(
+                        run_smart_crop,
+                        inputs=[inp_crop_img, inp_crop_frac,
+                                inp_crop_w_rough, inp_crop_w_dir, inp_crop_w_freq,
+                                inp_crop_mode, inp_crop_mx, inp_crop_my],
+                        outputs=[out_crop_overlay, out_crop_image, out_crop_info],
+                    )
+
+                with gr.Tab("Diffusion Pipeline"):
+                    gr.Markdown("Upload image -> Local trained model -> Generate heightfield\n\n"
+                                "**Train model first**: `python src/training/train.py`")
+                    inp_diff_img   = gr.Image(label="Input Image", type="numpy")
+                    inp_diff_steps = gr.Slider(10, 100, value=50, step=1, label="Sampling steps")
+                    btn_diff = gr.Button("Run Diffusion", variant="primary")
+                    out_diff_img  = gr.Image(label="Raw heightfield")
+                    out_diff_info = gr.Markdown()
+                    btn_diff.click(
+                        run_diffusion, inputs=[inp_diff_img, inp_diff_steps],
+                        outputs=[out_diff_img, out_diff_info],
+                    )
+
+                with gr.Tab("Mockup (OBJ)"):
+                    gr.Markdown("Load .npy heightfield -> 256x256 low-res OBJ preview")
+                    inp_moc_file = gr.File(label="Upload .npy (optional)", file_types=[".npy"])
+                    with gr.Row():
+                        inp_moc_size = gr.Number(label="Physical size (mm)", value=100.0)
+                        inp_moc_h    = gr.Number(label="Max height (mm)", value=10.0)
+                    btn_moc = gr.Button("Run Mockup", variant="primary")
+                    out_moc_img  = gr.Image(label="Mockup Render")
+                    out_moc_info = gr.Markdown()
+                    btn_moc.click(
+                        run_mockup, inputs=[inp_moc_file, inp_moc_size, inp_moc_h],
+                        outputs=[out_moc_img, out_moc_info],
+                    )
+
+        gr.Markdown(
+            '<div id="app-footer">Tactile Geometry &mdash; Texture to Fabrication</div>',
+        )
 
     return app
 
